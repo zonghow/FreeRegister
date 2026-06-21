@@ -1,0 +1,16 @@
+node_modules/
+npm-debug.log
+.DS_Store
+
+# Local secrets and mutable run state.
+config.toml
+email.txt
+email.success.txt
+email.inflight.txt
+email.failed.txt
+.email.lock
+auth/
+hotmail/
+cpa_json/
+*.bak
+*.tmp

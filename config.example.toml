@@ -1,0 +1,53 @@
+# 运行控制。
+# run_until_empty = true 时会忽略 total，按 concurrency 一直运行到 email.txt 无可用邮箱。
+[run]
+total = 1
+concurrency = 1
+max_phone_tries = 20
+use_browser_sentinel = false
+run_until_empty = false
+
+# OpenAI / Codex 登录配置。
+# CPA JSON 现在固定保存在 [cpa_json].dir；save_auth_json 只控制额外 auth/ 目录保存。
+[openai]
+default_password = "change-this-password"
+save_auth_json = false
+
+# HeroSMS 接码配置。
+# countries 非空时会按列表轮询国家；为空时使用 country。
+[hero_sms]
+api_key = ""
+country = 33
+countries = []
+max_price = 0.5
+price_tiers = [0.45]
+poll_attempts = 15
+poll_interval_ms = 3000
+
+# 邮箱池文件。
+# 并发读写会通过 lock 文件串行化；不要手动删除 inflight，除非确认任务已停止。
+[email_pool]
+source = "email.txt"
+success = "email.success.txt"
+inflight = "email.inflight.txt"
+failed = "email.failed.txt"
+lock = ".email.lock"
+
+# OAuth 成功后保存的 CPA JSON 目录。
+# Docker 中相对路径会落到 /data/cpa_json，也就是项目根目录的 cpa_json/。
+[cpa_json]
+dir = "cpa_json"
+
+# 代理池。多个代理会按 worker 轮询负载均衡。
+[proxies]
+urls = []
+
+# 只有 use_browser_sentinel = true 时才需要浏览器。
+[sentinel_browser]
+path = "/usr/bin/chromium"
+
+# Sentinel SDK 更新源和本地文件。
+# npm run update:sdk 会更新 file 指向的 sdk.js。
+[sentinel_sdk]
+url = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+file = "sdk.js"

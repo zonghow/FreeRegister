@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.DS_Store
+
+config.toml
+email.txt
+email.success.txt
+email.inflight.txt
+email.failed.txt
+.email.lock
+auth
+cpa_json
+*.bak
