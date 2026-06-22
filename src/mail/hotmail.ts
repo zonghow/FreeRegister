@@ -67,6 +67,7 @@ const HOTMAIL_FAST_POLL_INTERVAL_MS = 3000;
 const HOTMAIL_MESSAGE_FETCH_LIMIT = 10;
 const HOTMAIL_FOLDER_IDS = ["inbox", "junkemail"];
 const HOTMAIL_IMAP_FOLDERS = ["INBOX", "Junk"];
+const ALIAS_ACCOUNT_CACHE_LIMIT = 1000;
 const aliasAccountMap = new Map();
 let accountCache = null;
 
@@ -192,6 +193,22 @@ async function* guardedAsyncIterator(guard, iterable, signal) {
 
 function normalizeEmail(value) {
     return String(value ?? "").trim().toLowerCase();
+}
+
+function rememberAliasAccount(email, account) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) {
+        return;
+    }
+    if (aliasAccountMap.has(normalizedEmail)) {
+        aliasAccountMap.delete(normalizedEmail);
+    }
+    aliasAccountMap.set(normalizedEmail, account);
+    while (aliasAccountMap.size > ALIAS_ACCOUNT_CACHE_LIMIT) {
+        const oldest = aliasAccountMap.keys().next().value;
+        if (!oldest) break;
+        aliasAccountMap.delete(oldest);
+    }
 }
 
 function resolveApiMode(account) {
@@ -813,7 +830,7 @@ async function resolveAccountForEmail(email) {
     });
 
     if (matched) {
-        aliasAccountMap.set(normalizeEmail(email), matched);
+        rememberAliasAccount(email, matched);
         return matched;
     }
 
@@ -1056,7 +1073,7 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
 
     async function providerResolveAccount(email) {
         const normalizedEmail = normalizeEmail(email);
-        const mapped = providerAliasMap.get(normalizedEmail) || aliasAccountMap.get(normalizedEmail);
+        const mapped = providerAliasMap.get(normalizedEmail) || (leasedAccount ? null : aliasAccountMap.get(normalizedEmail));
         if (mapped) {
             return mapped;
         }
@@ -1081,7 +1098,9 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
             const account = chooseRandomAccount(accounts);
             const aliasEmail = buildAliasAddress(account);
             providerAliasMap.set(normalizeEmail(aliasEmail), account);
-            aliasAccountMap.set(normalizeEmail(aliasEmail), account);
+            if (!leasedAccount) {
+                rememberAliasAccount(aliasEmail, account);
+            }
             return aliasEmail;
         },
         async getEmailVerificationCode(email, options) {

@@ -14,6 +14,7 @@ interface FindVerificationMailOptions<T> {
     rememberLastCode?: boolean;
 }
 
+const LAST_VERIFICATION_CODE_CACHE_LIMIT = 1000;
 const lastVerificationCodeByEmail = new Map<string, string>();
 
 export function normalizeMailbox(value: string): string {
@@ -89,6 +90,21 @@ function collectCandidateTexts(mail: VerificationMailCandidate): string[] {
         .filter(Boolean);
 }
 
+function rememberLastVerificationCode(email: string, code: string): void {
+    if (!email || !code) {
+        return;
+    }
+    if (lastVerificationCodeByEmail.has(email)) {
+        lastVerificationCodeByEmail.delete(email);
+    }
+    lastVerificationCodeByEmail.set(email, code);
+    while (lastVerificationCodeByEmail.size > LAST_VERIFICATION_CODE_CACHE_LIMIT) {
+        const oldest = lastVerificationCodeByEmail.keys().next().value;
+        if (!oldest) break;
+        lastVerificationCodeByEmail.delete(oldest);
+    }
+}
+
 export function findLatestVerificationMail<T extends VerificationMailCandidate>(
     mails: T[],
     options: FindVerificationMailOptions<T> = {},
@@ -128,7 +144,7 @@ export function findLatestVerificationMail<T extends VerificationMailCandidate>(
             verificationCode,
         };
         if (targetEmail && options.rememberLastCode !== false) {
-            lastVerificationCodeByEmail.set(targetEmail, verificationCode);
+            rememberLastVerificationCode(targetEmail, verificationCode);
         }
         return matchedMail;
     }

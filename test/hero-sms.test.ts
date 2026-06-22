@@ -19,6 +19,10 @@ async function closeServer(server: ReturnType<typeof createServer>): Promise<voi
   });
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 test("parses HeroSMS balance responses", () => {
   assert.equal(normalizeHeroSmsBalance("ACCESS_BALANCE:12.345").amount, 12.345);
   assert.equal(normalizeHeroSmsBalance("ACCESS_BALANCE:12,34").amount, 12.34);
@@ -491,6 +495,62 @@ test("shares one HeroSMS account RPS window across getNumber and setStatus", asy
     assert.deepEqual(calls, ["getNumberV2", "setStatus"]);
     assert.ok(Date.now() - startedAt >= 35);
     assert.equal(getHeroSmsRpsStats(["shared-key"], {rpsLimit: 1, windowMs: 50})[0].windowCount, 1);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("prioritizes active HeroSMS status requests over new number requests", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const calls: string[] = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+    calls.push(action);
+
+    if (action === "getNumberV2") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "priority-window", phoneNumber: "573590000001"}));
+      return;
+    }
+
+    if (action === "getStatus") {
+      res.end("STATUS_WAIT_CODE");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const provider = createHeroSmsProvider({
+    apiKey: "priority-key",
+    rpsLimit: 1,
+    rateLimitWindowMs: 80,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+  });
+
+  try {
+    await provider.getActivationStatus("warmup");
+    const lowPriority = provider.requestPhoneNumber({
+      service: "dr",
+      country: 33,
+      maxPrice: 0.01,
+      fixedPrice: false,
+    });
+    const highPriority = provider.getActivationStatus("priority-window");
+
+    await delay(10);
+    const pending = getHeroSmsRpsStats(["priority-key"], {rpsLimit: 1, windowMs: 80})[0];
+    assert.equal(pending.pendingHigh, 1);
+    assert.equal(pending.pendingLow, 1);
+    assert.equal(pending.pendingTotal, 2);
+
+    await Promise.all([lowPriority, highPriority]);
+    assert.deepEqual(calls, ["getStatus", "getStatus", "getNumberV2"]);
   } finally {
     await closeServer(server);
   }

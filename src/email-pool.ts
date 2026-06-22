@@ -336,7 +336,9 @@ async function isStaleLock(lockPath: string): Promise<boolean> {
 
 async function readPoolLines(filePath: string): Promise<string[]> {
     const raw = await readRawFile(filePath);
-    return splitLines(raw).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+    return splitLines(raw)
+        .map((line) => flattenString(line.trim()))
+        .filter((line) => line && !line.startsWith("#"));
 }
 
 async function readRawFile(filePath: string): Promise<string> {
@@ -352,6 +354,10 @@ async function readRawFile(filePath: string): Promise<string> {
 
 function splitLines(raw: string): string[] {
     return raw.split(/\r?\n/).filter((line) => line.length > 0);
+}
+
+function flattenString(value: string): string {
+    return value.length ? ` ${value}`.slice(1) : "";
 }
 
 async function writePoolLinesAtomic(filePath: string, lines: string[]): Promise<void> {

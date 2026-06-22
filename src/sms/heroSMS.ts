@@ -11,7 +11,7 @@ import type {
   SmsProvider,
   SmsVerificationCode,
 } from "./provider.js";
-import {acquireHeroSmsApiSlot, redactHeroSmsKey} from "./heroSmsRateLimit.js";
+import {acquireHeroSmsApiSlot, redactHeroSmsKey, type HeroSmsApiPriority} from "./heroSmsRateLimit.js";
 
 const HERO_SMS_DEFAULT_BASE_URL = "https://hero-sms.com/stubs/handler_api.php";
 const HERO_SMS_DEFAULT_POLL_INTERVAL_MS = 5000;
@@ -438,6 +438,14 @@ export function normalizeHeroSmsCountries(payload: unknown): HeroSmsCountry[] {
   return countries;
 }
 
+function heroSmsPriorityForAction(action: string): HeroSmsApiPriority {
+  const normalized = action.trim();
+  if (normalized === "getNumberV2" || normalized === "getBalance" || normalized === "getCountries") {
+    return "low";
+  }
+  return "high";
+}
+
 function parseBalanceAmount(value: unknown): number | null {
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : null;
@@ -497,6 +505,7 @@ async function requestHeroSmsCountriesApi(
     await acquireHeroSmsApiSlot(apiKey, config.rateLimitLabel || `Key ${redactHeroSmsKey(apiKey)}`, {
       rpsLimit: config.rpsLimit,
       windowMs: config.rateLimitWindowMs,
+      priority: "low",
     });
     url.searchParams.set("api_key", apiKey);
   }
@@ -530,6 +539,7 @@ async function requestHeroSmsApi(
   await acquireHeroSmsApiSlot(apiKey, config.rateLimitLabel || `Key ${redactHeroSmsKey(apiKey)}`, {
     rpsLimit: config.rpsLimit,
     windowMs: config.rateLimitWindowMs,
+    priority: heroSmsPriorityForAction(action),
   });
   url.searchParams.set("api_key", apiKey);
   url.searchParams.set("action", action);

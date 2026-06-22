@@ -3,8 +3,13 @@
 [run]
 total = 1
 concurrency = 1
+# fixed 保持固定 worker 数；adaptive 会以 concurrency 为初始目标并自动扩缩容。
+concurrency_mode = "fixed"
 use_browser_sentinel = false
 run_until_empty = false
+# adaptive 模式下尽量贴近 HeroSMS 总 RPS 上限的目标利用率；0.9 表示 90%。
+adaptive_target_sms_rps_utilization = 0.9
+adaptive_control_interval_ms = 5000
 # 0 表示按当前 Node heap 自动计算；达到软阈值会停止派发新任务，达到硬阈值会强制暂停。
 memory_soft_limit_mb = 0
 memory_hard_limit_mb = 0

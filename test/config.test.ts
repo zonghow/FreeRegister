@@ -10,8 +10,11 @@ test("parses required toml shapes", () => {
 [run]
 total = 100
 concurrency = 10
+concurrency_mode = "adaptive"
 use_browser_sentinel = true
 run_until_empty = true
+adaptive_target_sms_rps_utilization = 0.95
+adaptive_control_interval_ms = 2000
 
 [proxies]
 urls = ["socks5://a", "http://b"]
@@ -32,8 +35,11 @@ auto_release_on_timeout = true
 
     assert.equal(parsed.run.total, 100);
     assert.equal(parsed.run.concurrency, 10);
+    assert.equal(parsed.run.concurrency_mode, "adaptive");
     assert.equal(parsed.run.use_browser_sentinel, true);
     assert.equal(parsed.run.run_until_empty, true);
+    assert.equal(parsed.run.adaptive_target_sms_rps_utilization, 0.95);
+    assert.equal(parsed.run.adaptive_control_interval_ms, 2000);
     assert.deepEqual(parsed.proxies.urls, ["socks5://a", "http://b"]);
     assert.deepEqual(parsed.hero_sms.countries, [33, 52]);
     assert.equal(parsed.hero_sms.acquire_priority, "price_high");
@@ -53,8 +59,11 @@ test("loads config defaults and applies cli overrides", async () => {
 [run]
 total = 2
 concurrency = 1
+concurrency_mode = "adaptive"
 max_phone_tries = 7
 run_until_empty = false
+adaptive_target_sms_rps_utilization = 0.95
+adaptive_control_interval_ms = 2500
 memory_soft_limit_mb = 7000
 memory_hard_limit_mb = 8000
 
@@ -102,7 +111,10 @@ file = "custom-sdk.js"
 
         assert.equal(overridden.run.total, 5);
         assert.equal(overridden.run.concurrency, 3);
+        assert.equal(overridden.run.concurrencyMode, "adaptive");
         assert.equal(overridden.run.maxPhoneTries, 7);
+        assert.equal(overridden.run.adaptiveTargetSmsRpsUtilization, 0.95);
+        assert.equal(overridden.run.adaptiveControlIntervalMs, 2500);
         assert.equal(overridden.run.memorySoftLimitMb, 7000);
         assert.equal(overridden.run.memoryHardLimitMb, 8000);
         assert.equal(overridden.heroSMS.apiKey, "hero-one");
@@ -171,6 +183,10 @@ test("keeps legacy hero sms api_key compatibility and defaults invalid strategy"
     try {
         const configPath = path.join(dir, "config.toml");
         await writeFile(configPath, `
+[run]
+concurrency_mode = "surprise"
+adaptive_target_sms_rps_utilization = 5
+
 [hero_sms]
 api_key = "legacy-key"
 api_key_strategy = "surprise"
@@ -178,6 +194,9 @@ api_key_strategy = "surprise"
 
         const loaded = loadConfig(configPath);
 
+        assert.equal(loaded.run.concurrencyMode, "fixed");
+        assert.equal(loaded.run.adaptiveTargetSmsRpsUtilization, 1);
+        assert.equal(loaded.run.adaptiveControlIntervalMs, 5000);
         assert.equal(loaded.heroSMS.apiKey, "legacy-key");
         assert.deepEqual(loaded.heroSMS.apiKeys, ["legacy-key"]);
         assert.equal(loaded.heroSMS.apiKeyStrategy, "round_robin");

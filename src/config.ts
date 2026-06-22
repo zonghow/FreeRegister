@@ -5,9 +5,12 @@ import {DEFAULT_SENTINEL_SDK_URL} from "./sentinel-sdk.js";
 export interface RunConfig {
     total: number;
     concurrency: number;
+    concurrencyMode: RunConcurrencyMode;
     maxPhoneTries: number;
     useBrowserSentinel: boolean;
     runUntilEmpty: boolean;
+    adaptiveTargetSmsRpsUtilization: number;
+    adaptiveControlIntervalMs: number;
     memorySoftLimitMb: number;
     memoryHardLimitMb: number;
 }
@@ -79,6 +82,7 @@ export interface AppConfig {
 
 export type HeroSMSApiKeyStrategy = "round_robin" | "fill_first";
 export type HeroSMSProxyStrategy = "hero_sms" | "proxies" | "direct";
+export type RunConcurrencyMode = "fixed" | "adaptive";
 type TomlValue = string | number | boolean | string[] | number[];
 type TomlObject = Record<string, Record<string, TomlValue>>;
 
@@ -86,9 +90,12 @@ const DEFAULT_CONFIG: AppConfig = {
     run: {
         total: 1,
         concurrency: 1,
+        concurrencyMode: "fixed",
         maxPhoneTries: 20,
         useBrowserSentinel: false,
         runUntilEmpty: false,
+        adaptiveTargetSmsRpsUtilization: 0.9,
+        adaptiveControlIntervalMs: 5000,
         memorySoftLimitMb: 0,
         memoryHardLimitMb: 0,
     },
@@ -286,6 +293,18 @@ function positiveInteger(value: number, fallback: number): number {
     return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+function boundedNumber(value: number, fallback: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    return Math.min(max, Math.max(min, value));
+}
+
+function normalizeRunConcurrencyMode(value: TomlValue | undefined, fallback: RunConcurrencyMode): RunConcurrencyMode {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (["adaptive", "auto", "dynamic"].includes(normalized)) return "adaptive";
+    if (["fixed", "static"].includes(normalized)) return "fixed";
+    return fallback;
+}
+
 function normalizeAcquirePriority(value: TomlValue | undefined, fallback: HeroSMSConfig["acquirePriority"]): HeroSMSConfig["acquirePriority"] {
     const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
     if (normalized === "country") return "country";
@@ -441,9 +460,20 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         run: {
             total: positiveInteger(numberValue(run.total, DEFAULT_CONFIG.run.total), DEFAULT_CONFIG.run.total),
             concurrency: positiveInteger(numberValue(run.concurrency, DEFAULT_CONFIG.run.concurrency), DEFAULT_CONFIG.run.concurrency),
+            concurrencyMode: normalizeRunConcurrencyMode(run.concurrency_mode, DEFAULT_CONFIG.run.concurrencyMode),
             maxPhoneTries: runMaxPhoneTries,
             useBrowserSentinel: booleanValue(run.use_browser_sentinel, DEFAULT_CONFIG.run.useBrowserSentinel),
             runUntilEmpty: booleanValue(run.run_until_empty, DEFAULT_CONFIG.run.runUntilEmpty),
+            adaptiveTargetSmsRpsUtilization: boundedNumber(
+                numberValue(run.adaptive_target_sms_rps_utilization, DEFAULT_CONFIG.run.adaptiveTargetSmsRpsUtilization),
+                DEFAULT_CONFIG.run.adaptiveTargetSmsRpsUtilization,
+                0.1,
+                1,
+            ),
+            adaptiveControlIntervalMs: positiveInteger(
+                numberValue(run.adaptive_control_interval_ms, DEFAULT_CONFIG.run.adaptiveControlIntervalMs),
+                DEFAULT_CONFIG.run.adaptiveControlIntervalMs,
+            ),
             memorySoftLimitMb: Math.max(0, Math.floor(numberValue(run.memory_soft_limit_mb, DEFAULT_CONFIG.run.memorySoftLimitMb))),
             memoryHardLimitMb: Math.max(0, Math.floor(numberValue(run.memory_hard_limit_mb, DEFAULT_CONFIG.run.memoryHardLimitMb))),
         },

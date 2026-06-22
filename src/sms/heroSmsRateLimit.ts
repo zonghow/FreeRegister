@@ -1,9 +1,21 @@
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 1000;
 
+export type HeroSmsApiPriority = "high" | "low";
+
+interface SlotWaiter {
+  priority: HeroSmsApiPriority;
+  requestedAt: number;
+  rpsLimit: number;
+  windowMs: number;
+  resolve: () => void;
+}
+
 interface KeyRateState {
   apiKey: string;
   label: string;
   requestTimestamps: number[];
+  waiters: SlotWaiter[];
+  wakeTimer: ReturnType<typeof setTimeout> | null;
   disabled: boolean;
   disabledReason: string;
   lastRequestAt: number;
@@ -20,18 +32,19 @@ export interface HeroSmsKeyRpsSnapshot {
   disabled: boolean;
   disabledReason: string;
   lastRequestAt: string;
+  pendingHigh: number;
+  pendingLow: number;
+  pendingTotal: number;
+  oldestPendingMs: number;
 }
 
 export interface HeroSmsRateLimitOptions {
   rpsLimit?: number;
   windowMs?: number;
+  priority?: HeroSmsApiPriority;
 }
 
 const keyRateStates = new Map<string, KeyRateState>();
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(1, ms)));
-}
 
 function normalizeApiKeys(apiKeys: string[]): string[] {
   const seen = new Set<string>();
@@ -68,6 +81,8 @@ function rateStateFor(apiKey: string, label: string): KeyRateState {
     apiKey,
     label,
     requestTimestamps: [],
+    waiters: [],
+    wakeTimer: null,
     disabled: false,
     disabledReason: "",
     lastRequestAt: 0,
@@ -86,6 +101,75 @@ function stateWaitMs(state: KeyRateState, now: number, windowMs: number): number
   pruneRateWindow(state, now, windowMs);
   const oldest = state.requestTimestamps[0];
   return oldest == null ? 1 : Math.max(1, windowMs - (now - oldest));
+}
+
+function normalizePriority(priority?: HeroSmsApiPriority): HeroSmsApiPriority {
+  return priority === "high" ? "high" : "low";
+}
+
+function nextWaiterIndex(state: KeyRateState): number {
+  const highIndex = state.waiters.findIndex((waiter) => waiter.priority === "high");
+  return highIndex >= 0 ? highIndex : 0;
+}
+
+function pendingCounts(state: KeyRateState, now = Date.now()) {
+  let pendingHigh = 0;
+  let pendingLow = 0;
+  let oldestPendingAt = 0;
+  for (const waiter of state.waiters) {
+    if (waiter.priority === "high") {
+      pendingHigh += 1;
+    } else {
+      pendingLow += 1;
+    }
+    oldestPendingAt = oldestPendingAt > 0 ? Math.min(oldestPendingAt, waiter.requestedAt) : waiter.requestedAt;
+  }
+  return {
+    pendingHigh,
+    pendingLow,
+    pendingTotal: pendingHigh + pendingLow,
+    oldestPendingMs: oldestPendingAt > 0 ? Math.max(0, now - oldestPendingAt) : 0,
+  };
+}
+
+function scheduleQueueWake(state: KeyRateState, waitMs: number): void {
+  if (state.wakeTimer) {
+    return;
+  }
+  state.wakeTimer = setTimeout(() => {
+    state.wakeTimer = null;
+    processQueue(state);
+  }, Math.max(1, waitMs));
+  state.wakeTimer.unref?.();
+}
+
+function processQueue(state: KeyRateState): void {
+  if (state.wakeTimer) {
+    clearTimeout(state.wakeTimer);
+    state.wakeTimer = null;
+  }
+
+  for (;;) {
+    if (!state.waiters.length) {
+      return;
+    }
+    const waiterIndex = nextWaiterIndex(state);
+    const waiter = state.waiters[waiterIndex];
+    if (!waiter) {
+      return;
+    }
+    const now = Date.now();
+    pruneRateWindow(state, now, waiter.windowMs);
+    if (state.requestTimestamps.length < waiter.rpsLimit) {
+      state.waiters.splice(waiterIndex, 1);
+      state.requestTimestamps.push(now);
+      state.lastRequestAt = now;
+      waiter.resolve();
+      continue;
+    }
+    scheduleQueueWake(state, stateWaitMs(state, now, waiter.windowMs));
+    return;
+  }
 }
 
 export function disableHeroSmsApiKey(apiKey: string, reason: string, label?: string): void {
@@ -118,6 +202,7 @@ export function getHeroSmsApiKeyRpsSnapshot(
   pruneRateWindow(state, now, windowMs);
   const windowCount = state.requestTimestamps.length;
   const rps = Math.round((windowCount * 1000 / windowMs) * 100) / 100;
+  const pending = pendingCounts(state, now);
   return {
     index: 0,
     label,
@@ -129,6 +214,7 @@ export function getHeroSmsApiKeyRpsSnapshot(
     disabled: state.disabled,
     disabledReason: state.disabledReason,
     lastRequestAt: state.lastRequestAt > 0 ? new Date(state.lastRequestAt).toISOString() : "",
+    ...pending,
   };
 }
 
@@ -152,20 +238,27 @@ export async function acquireHeroSmsApiSlot(
   if (!trimmed) return;
   const rpsLimit = normalizeRpsLimit(options.rpsLimit);
   const windowMs = normalizeRateLimitWindowMs(options.windowMs);
+  const priority = normalizePriority(options.priority);
   const state = rateStateFor(trimmed, label || `Key ${redactHeroSmsKey(trimmed)}`);
 
-  for (;;) {
-    const now = Date.now();
-    pruneRateWindow(state, now, windowMs);
-    if (state.requestTimestamps.length < rpsLimit) {
-      state.requestTimestamps.push(now);
-      state.lastRequestAt = now;
-      return;
-    }
-    await sleep(stateWaitMs(state, now, windowMs));
-  }
+  await new Promise<void>((resolve) => {
+    state.waiters.push({
+      priority,
+      requestedAt: Date.now(),
+      rpsLimit,
+      windowMs,
+      resolve,
+    });
+    processQueue(state);
+  });
 }
 
 export function resetHeroSmsRpsStatsForTest(): void {
+  for (const state of keyRateStates.values()) {
+    if (state.wakeTimer) {
+      clearTimeout(state.wakeTimer);
+      state.wakeTimer = null;
+    }
+  }
   keyRateStates.clear();
 }

@@ -481,6 +481,12 @@ function proxyStrategyFromBody(value: unknown, fallback: HeroSMSProxyStrategy): 
     return fallback;
 }
 
+function runConcurrencyModeFromBody(value: unknown, fallback: AppConfig["run"]["concurrencyMode"]): AppConfig["run"]["concurrencyMode"] {
+    const normalized = String(value ?? "").trim();
+    if (normalized === "fixed" || normalized === "adaptive") return normalized;
+    return fallback;
+}
+
 function publicConfigSummary(config: AppConfig): JsonValue {
     return {
         run: config.run as unknown as JsonValue,
@@ -842,11 +848,13 @@ async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string,
 
 function heroSmsRpsStatus(config: AppConfig): JsonValue {
     const keys = getHeroSmsRpsStats(config.heroSMS.apiKeys, {rpsLimit: config.heroSMS.rpsLimit});
+    const pendingTotal = keys.reduce((sum, item) => sum + (item.pendingTotal || 0), 0);
     return {
         ok: true,
         keys: keys as unknown as JsonValue,
         totalRps: Math.round(keys.reduce((sum, item) => sum + item.rps, 0) * 100) / 100,
         totalLimit: keys.reduce((sum, item) => sum + item.rpsLimit, 0),
+        pendingTotal,
         fetchedAt: new Date().toISOString(),
     };
 }
@@ -958,6 +966,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const countryStatus = await heroSmsCountriesStatus(config, refreshCountries);
         sendJson(res, 200, {
             ok: true,
+            run: config.run as unknown as JsonValue,
             heroSMS: smsConfigJson(config),
             countries: mergeSelectedCountries(countryStatus.countries, config.heroSMS.countries) as unknown as JsonValue,
             countriesSource: countryStatus.source,
@@ -975,6 +984,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const minPrice = numberFromBody(body.minPrice, hero.minPrice);
         const maxPrice = numberFromBody(body.maxPrice, hero.maxPrice);
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
+        const runValues = {
+            concurrency_mode: runConcurrencyModeFromBody(body.concurrencyMode, config.run.concurrencyMode),
+        };
         const values = {
             proxy_strategy: proxyStrategyFromBody(body.proxyStrategy, hero.proxyStrategy),
             api_key_strategy: apiKeyStrategyFromBody(body.apiKeyStrategy, hero.apiKeyStrategy),
@@ -992,12 +1004,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-        const nextContent = upsertTomlSection(content, "hero_sms", values, ["country", "price_tiers", "poll_attempts", "use_proxy"]);
+        const nextContent = upsertTomlSection(
+            upsertTomlSection(content, "run", runValues),
+            "hero_sms",
+            values,
+            ["country", "price_tiers", "poll_attempts", "use_proxy"],
+        );
         parseToml(nextContent);
         await writeFileAtomic(file, nextContent);
         heroSmsBalanceCache = null;
-        logger.info("[admin] 接码配置已保存，下次启动任务会读取最新配置");
-        sendJson(res, 200, {ok: true, heroSMS: smsConfigJson(loadConfig())});
+        logger.info(`[admin] 接码配置已保存 concurrency_mode=${runValues.concurrency_mode}，下次启动任务会读取最新配置`);
+        const nextConfig = loadConfig();
+        sendJson(res, 200, {ok: true, run: nextConfig.run as unknown as JsonValue, heroSMS: smsConfigJson(nextConfig)});
         return;
     }
 
@@ -1202,7 +1220,7 @@ function html(): string {
     <main>
       <section class="grid">
         <div class="panel metric">待使用<strong id="countSource">0</strong></div>
-        <div class="panel metric">成功<strong id="countSuccess">0</strong><span id="successCostMeta" class="sub"></span></div>
+        <div class="panel metric">成功<strong id="countSuccess">0</strong><span id="successCostMeta" class="sub"></span><span id="successRunMeta" class="sub"></span></div>
         <div class="panel metric"><span>进行中</span><strong id="countInflight">0</strong><div class="metric-actions"><button id="returnInflightBtn" type="button" class="secondary">归还</button><button id="failInflightBtn" type="button" class="secondary">标失败</button></div></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
@@ -1251,9 +1269,24 @@ function html(): string {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section class="panel stack">
+        <div class="panel-head">
+          <h2>运行模式</h2>
+        </div>
+        <div class="form-grid">
+          <label><span>并发模式</span><select id="runConcurrencyMode">
+            <option value="fixed">fixed</option>
+            <option value="adaptive">adaptive</option>
+          </select></label>
+        </div>
+      </section>
+
+      <section class="panel stack">
         <div class="panel-head">
           <h2>接码配置</h2>
-          <span id="smsConfigMsg" class="msg"></span>
+          <span id="smsCountrySource" class="muted"></span>
         </div>
         <div class="form-grid">
           <label><span>接口代理策略</span><select id="smsProxyStrategy">
@@ -1274,11 +1307,18 @@ function html(): string {
           <label><span>最高价格</span><input id="smsMaxPrice" type="number" min="0" step="0.0001"></label>
           <label><span>价格档位</span><input id="smsPriceStep" type="number" min="0" step="0.0001"></label>
           <label><span>最多换号</span><input id="smsMaxPhoneTries" type="number" min="1" step="1"></label>
-          <label class="country-field"><span>添加国家 <em id="smsCountrySource" class="muted"></em></span><span class="country-picker-row"><input id="smsCountrySearch" placeholder="搜索国家 / ID" autocomplete="off"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
+          <label class="country-field"><span>添加国家</span><span class="country-picker-row"><input id="smsCountrySearch" placeholder="搜索国家 / ID" autocomplete="off"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
         </div>
         <div id="smsCountryList" class="country-list"></div>
+      </section>
+
+      <section class="panel stack">
+        <div class="panel-head">
+          <h2>配置操作</h2>
+          <span id="smsConfigMsg" class="msg"></span>
+        </div>
         <div class="row">
-          <button id="saveSmsConfigBtn">保存接码配置</button>
+          <button id="saveSmsConfigBtn">保存配置</button>
           <button id="reloadSmsConfigBtn" class="secondary">重新加载</button>
         </div>
       </section>
@@ -1529,6 +1569,12 @@ function html(): string {
       return amount.toFixed(2).replace(/\\.00$/, "");
     }
 
+    function formatPercent(value) {
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return "-";
+      return Math.round(amount * 100) + "%";
+    }
+
     function formatUtc8Timestamp(value) {
       const parsed = value == null ? Date.now() : Date.parse(value || "");
       if (!Number.isFinite(parsed)) return "";
@@ -1585,16 +1631,18 @@ function html(): string {
 
       const totalRps = Number(status.totalRps || 0);
       const totalLimit = Number(status.totalLimit || 0);
-      setText("heroSmsRpsTotal", formatRpsAmount(totalRps) + " / " + (totalLimit || 0));
+      const pendingTotal = Number(status.pendingTotal || 0);
+      setText("heroSmsRpsTotal", formatRpsAmount(totalRps) + " / " + (totalLimit || 0) + (pendingTotal > 0 ? " · 等 " + pendingTotal : ""));
       const fragment = document.createDocumentFragment();
       for (const item of status.keys) {
+        const pending = Number(item.pendingTotal || 0);
         const row = document.createElement("div");
         row.className = "sms-rps-item" + (item.disabled ? " disabled" : "");
-        row.title = String(item.label || "Key") + " · " + String(item.windowCount || 0) + " req/" + String(item.windowMs || 1000) + "ms";
+        row.title = String(item.label || "Key") + " · " + String(item.windowCount || 0) + " req/" + String(item.windowMs || 1000) + "ms" + (pending > 0 ? " · pending " + pending : "");
         const label = document.createElement("span");
         label.textContent = String(item.label || ("Key #" + item.index));
         const value = document.createElement("span");
-        value.textContent = (item.disabled ? "停用 " : "") + formatRpsAmount(item.rps) + " / " + String(item.rpsLimit || 0);
+        value.textContent = (item.disabled ? "停用 " : "") + formatRpsAmount(item.rps) + " / " + String(item.rpsLimit || 0) + (pending > 0 ? " 等" + pending : "");
         row.appendChild(label);
         row.appendChild(value);
         fragment.appendChild(row);
@@ -1614,6 +1662,12 @@ function html(): string {
       const estimated = Number(cost.estimatedCount || 0);
       if (estimated > 0) lines.push(estimated + " 估算");
       setText("successCostMeta", lines.join("\\n"));
+    }
+
+    function updateSuccessRunMeta(runner) {
+      const okCount = Number(runner && runner.okCount || 0);
+      const avgMs = Number(runner && runner.avgSuccessIntervalMs || 0);
+      setText("successRunMeta", "本轮 " + okCount + " · 均时 " + formatElapsedMs(avgMs));
     }
 
     function countryLabel(id) {
@@ -1732,12 +1786,14 @@ function html(): string {
         const prefix = data.countriesSource === "fallback" ? "国家列表接口失败，已用内置列表：" : "国家列表刷新失败，继续使用永久缓存：";
         setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
       }
+      if (data.run) $("runConcurrencyMode").value = data.run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
       fillSmsForm(data.heroSMS || {});
       renderCountryPicker();
     }
 
     function smsPayloadFromForm() {
       return {
+        concurrencyMode: $("runConcurrencyMode").value,
         countries: state.selectedSmsCountries,
         apiKeyStrategy: $("smsApiKeyStrategy").value,
         acquirePriority: $("smsAcquirePriority").value,
@@ -1769,6 +1825,7 @@ function html(): string {
       setText("countSource", pool.source || 0);
       setText("countSuccess", pool.success || 0);
       updateSuccessCost(data.successCost);
+      updateSuccessRunMeta(runner);
       setText("countInflight", state.inflightCount);
       setText("countFailed", pool.failed || 0);
       updateInflightButtons();
@@ -1781,7 +1838,16 @@ function html(): string {
       if (data.effectiveConfig && data.effectiveConfig.run) {
         const run = data.effectiveConfig.run;
         const mode = run.runUntilEmpty ? "持续运行到邮箱池为空" : "固定数量";
-        setText("taskConfig", "模式 " + mode + " · total " + run.total + " · concurrency " + run.concurrency);
+        const concurrencyMode = (runner.concurrencyMode || run.concurrencyMode) === "adaptive" ? "adaptive" : "fixed";
+        $("runConcurrencyMode").value = run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+        const parts = ["模式 " + mode, "并发 " + concurrencyMode, "total " + run.total, "concurrency " + run.concurrency];
+        if (concurrencyMode === "adaptive") {
+          parts.push("worker " + Number(runner.currentConcurrency || 0) + "/" + Number(runner.targetConcurrency || 0) + "/max " + Number(runner.maxConcurrency || 0));
+          parts.push("HeroSMS " + formatRpsAmount(runner.adaptiveSmsRps || 0) + "/" + Number(runner.adaptiveSmsRpsLimit || 0) + " target " + formatPercent(runner.adaptiveTargetSmsRpsUtilization || run.adaptiveTargetSmsRpsUtilization || 0));
+          if (Number(runner.adaptiveSlotWaiters || 0) > 0) parts.push("等待 " + Number(runner.adaptiveSlotWaiters || 0));
+          if (runner.adaptiveReason) parts.push(String(runner.adaptiveReason));
+        }
+        setText("taskConfig", parts.join(" · "));
       }
     }
 
