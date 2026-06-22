@@ -38,6 +38,7 @@ cp config.example.toml config.toml
 ```toml
 [hero_sms]
 api_key = "your-hero-sms-api-key"
+use_proxy = false
 
 [proxies]
 urls = []
@@ -153,6 +154,7 @@ save_auth_json = false
 
 [hero_sms]
 api_key = ""
+use_proxy = false
 countries = [33]
 acquire_priority = "country"
 min_price = 0.45
@@ -185,6 +187,8 @@ urls = []
 网页后台的国家选项会优先从 HeroSMS `getCountries` 接口获取，并永久缓存到 `.cache/hero-sms-countries.json`；接口失败时会继续使用旧缓存，没有缓存时才切换到内置兜底列表。点击“重新加载”会主动刷新这份缓存。
 
 `auto_release_on_timeout = true` 时，如果一个号码在固定轮询窗口内仍未收到验证码，会主动调用 HeroSMS 取消/释放该号码，然后换新号。最多轮询次数不支持配置，程序会按 `poll_interval_ms` 自动计算到超过 2 分钟；默认 `3000ms` 间隔下是 42 次。
+
+`use_proxy = true` 时，HeroSMS 的取号、查码、释放号码、余额和国家列表接口都会走 `[proxies].urls`；注册任务中按 worker 轮询代理，后台余额和国家列表使用第一个代理。
 
 代理只从 `[proxies].urls` 读取。留空表示直连；配置多个代理时会按 worker 轮询负载均衡：
 

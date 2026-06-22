@@ -4,7 +4,7 @@ import {mkdir, readFile, readdir, rename, stat, writeFile} from "node:fs/promise
 import path from "node:path";
 import JSZip from "jszip";
 import {EmailPool, emailFromLine} from "./email-pool.js";
-import {loadConfig, parseToml, proxyForWorker, redactProxy, type AppConfig, type HeroSMSConfig} from "./config.js";
+import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
 
@@ -472,7 +472,7 @@ function heroSmsBalanceCacheKey(config: AppConfig): string {
     return createHash("sha256")
         .update(config.heroSMS.apiKey)
         .update("\0")
-        .update(proxyForWorker(config, 0))
+        .update(heroSmsProxyForWorker(config, 0))
         .digest("hex");
 }
 
@@ -562,7 +562,7 @@ async function writeHeroSmsCountriesCache(status: HeroSmsCountriesStatus): Promi
 async function fetchHeroSmsCountries(config: AppConfig): Promise<HeroSmsCountriesStatus> {
     const provider = createHeroSmsProvider({
         apiKey: config.heroSMS.apiKey,
-        proxyUrl: proxyForWorker(config, 0),
+        proxyUrl: heroSmsProxyForWorker(config, 0),
         timeoutMs: HERO_SMS_COUNTRIES_TIMEOUT_MS,
     });
     const countries = countryOptionsFromProvider(await provider.getCountries());
@@ -643,7 +643,7 @@ async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: 
         try {
             const provider = createHeroSmsProvider({
                 apiKey: config.heroSMS.apiKey,
-                proxyUrl: proxyForWorker(config, 0),
+                proxyUrl: heroSmsProxyForWorker(config, 0),
                 timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
             });
             const balance = await provider.getBalance();
@@ -882,6 +882,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
         const values = {
             api_key: typeof body.apiKey === "string" ? body.apiKey.trim() : hero.apiKey,
+            use_proxy: Boolean(body.useProxy),
             countries: countriesFromBody(body.countries, hero.countries),
             acquire_priority: priorityFromBody(body.acquirePriority, hero.acquirePriority),
             min_price: Math.min(minPrice, maxPrice),
@@ -1146,6 +1147,7 @@ function html(): string {
         </div>
         <div class="form-grid">
           <label class="wide"><span>HeroSMS API Key</span><input id="smsApiKey" autocomplete="off"></label>
+          <label><span>接口代理</span><span class="check-row"><input id="smsUseProxy" type="checkbox">走代理池</span></label>
           <label><span>取号策略</span><select id="smsAcquirePriority">
             <option value="country">国家优先</option>
             <option value="price_low">低价优先</option>
@@ -1525,6 +1527,7 @@ function html(): string {
       setInputValue("smsMaxPhoneTries", hero.maxPhoneTries);
       setInputValue("smsPollIntervalMs", hero.pollIntervalMs);
       updateSmsPollAttemptsLabel(hero.pollIntervalMs);
+      $("smsUseProxy").checked = hero.useProxy === true;
       $("smsAutoRelease").checked = hero.autoReleaseOnTimeout !== false;
       state.selectedSmsCountries = Array.isArray(hero.countries) ? hero.countries.map(Number).filter(Boolean) : [];
       renderSelectedCountries();
@@ -1554,6 +1557,7 @@ function html(): string {
         priceStep: Number($("smsPriceStep").value),
         maxPhoneTries: Number($("smsMaxPhoneTries").value),
         pollIntervalMs: Number($("smsPollIntervalMs").value),
+        useProxy: $("smsUseProxy").checked,
         autoReleaseOnTimeout: $("smsAutoRelease").checked
       };
     }

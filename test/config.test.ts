@@ -3,7 +3,7 @@ import {mkdtemp, rm, writeFile} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {applyCliOverrides, loadConfig, parseToml, proxyForWorker} from "../src/config.js";
+import {applyCliOverrides, heroSmsProxyForWorker, loadConfig, parseToml, proxyForWorker} from "../src/config.js";
 
 test("parses required toml shapes", () => {
     const parsed = parseToml(`
@@ -54,6 +54,7 @@ save_auth_json = true
 
 [hero_sms]
 api_key = "hero"
+use_proxy = true
 countries = [33, 52]
 acquire_priority = "price_low"
 min_price = 0.04
@@ -84,6 +85,7 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.maxPhoneTries, 7);
         assert.equal(overridden.run.memorySoftLimitMb, 7000);
         assert.equal(overridden.run.memoryHardLimitMb, 8000);
+        assert.equal(overridden.heroSMS.useProxy, true);
         assert.deepEqual(overridden.heroSMS.countries, [33, 52]);
         assert.equal(overridden.heroSMS.acquirePriority, "price_low");
         assert.equal(overridden.heroSMS.minPrice, 0.04);
@@ -98,6 +100,8 @@ file = "custom-sdk.js"
         assert.equal(proxyForWorker(overridden, 0), "socks5://one");
         assert.equal(proxyForWorker(overridden, 1), "socks5://two");
         assert.equal(proxyForWorker(overridden, 2), "socks5://one");
+        assert.equal(heroSmsProxyForWorker(overridden, 0), "socks5://one");
+        assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, useProxy: false}}, 0), "");
         assert.equal(overridden.cpaJson.dir, path.join(dir, "custom-cpa"));
         assert.equal(overridden.sentinelSdk.url, "https://example.com/sdk.js");
         assert.equal(overridden.sentinelSdk.file, "custom-sdk.js");

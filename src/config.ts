@@ -19,6 +19,7 @@ export interface OpenAIConfig {
 
 export interface HeroSMSConfig {
     apiKey: string;
+    useProxy: boolean;
     countries: number[];
     acquirePriority: "country" | "price_low" | "price_high";
     minPrice: number;
@@ -82,6 +83,7 @@ const DEFAULT_CONFIG: AppConfig = {
     },
     heroSMS: {
         apiKey: "",
+        useProxy: false,
         countries: [33],
         acquirePriority: "country",
         minPrice: 0.45,
@@ -392,6 +394,7 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         openai: openAIConfig,
         heroSMS: {
             apiKey: stringValue(hero.api_key, DEFAULT_CONFIG.heroSMS.apiKey),
+            useProxy: booleanValue(hero.use_proxy, DEFAULT_CONFIG.heroSMS.useProxy),
             countries: configuredCountries.length ? configuredCountries : [legacyCountry],
             acquirePriority: normalizeAcquirePriority(hero.acquire_priority, DEFAULT_CONFIG.heroSMS.acquirePriority),
             minPrice,
@@ -466,6 +469,10 @@ function readNumberArg(argv: string[], flag: string): number | null {
 export function proxyForWorker(config: AppConfig, workerIndex: number): string {
     if (!config.proxies.length) return "";
     return config.proxies[workerIndex % config.proxies.length];
+}
+
+export function heroSmsProxyForWorker(config: AppConfig, workerIndex: number): string {
+    return config.heroSMS.useProxy ? proxyForWorker(config, workerIndex) : "";
 }
 
 export function redactProxy(proxyUrl: string): string {

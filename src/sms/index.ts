@@ -4,6 +4,7 @@ import type { HeroSmsActivation, HeroSmsProvider, HeroSmsVerificationCode } from
 
 type HeroSMSBrokerOption = {
   apiKey: string;
+  proxyUrl?: string;
   countries: number[];
   acquirePriority: "country" | "price_low" | "price_high";
   minPrice: number;
@@ -68,6 +69,7 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
 
   const heroProvider = createHeroSmsProvider({
     apiKey: option.apiKey,
+    proxyUrl: option.proxyUrl,
     defaultRequestOptions: {
       service: "dr",
       country: countries[0],

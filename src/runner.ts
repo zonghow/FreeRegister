@@ -1,5 +1,5 @@
 import {getHeapStatistics} from "node:v8";
-import {proxyForWorker, redactProxy, type AppConfig} from "./config.js";
+import {heroSmsProxyForWorker, proxyForWorker, redactProxy, type AppConfig} from "./config.js";
 import {EmailPool, type EmailLease} from "./email-pool.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
@@ -195,13 +195,14 @@ function withElapsed(worker: WorkerSnapshot): WorkerSnapshot {
 
 type WorkerUpdate = (patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>) => void;
 
-function createBroker(config: AppConfig) {
+function createBroker(config: AppConfig, proxyUrl: string) {
     const hero = config.heroSMS;
     if (!hero.apiKey) {
         throw new Error("缺少 [hero_sms].api_key");
     }
     return createSMSBroker({
         apiKey: hero.apiKey,
+        proxyUrl,
         pollIntervalMs: hero.pollIntervalMs,
         countries: hero.countries,
         acquirePriority: hero.acquirePriority,
@@ -225,7 +226,7 @@ async function phoneSignup(
     signal?: AbortSignal,
     updateWorker?: WorkerUpdate,
 ): Promise<{phone: string}> {
-    const smsBroker = createBroker(config);
+    const smsBroker = createBroker(config, heroSmsProxyForWorker(config, workerId - 1));
     let lastErr: unknown = null;
 
     for (let phoneTry = 1; phoneTry <= config.heroSMS.maxPhoneTries; phoneTry += 1) {

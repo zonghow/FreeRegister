@@ -20,6 +20,8 @@ save_auth_json = false
 # acquire_priority 可选 country / price_low / price_high。
 [hero_sms]
 api_key = ""
+# true 时 HeroSMS 取号、查码、释放号码、余额和国家列表接口都会走 [proxies].urls。
+use_proxy = false
 countries = [33]
 acquire_priority = "country"
 min_price = 0.45

@@ -72,6 +72,7 @@ docker run --rm \
 Notes:
 
 - Proxy URLs are configured only in `config.toml` under `[proxies].urls`; leave the array empty for direct connections.
+- HeroSMS API calls use proxies only when `[hero_sms].use_proxy = true`.
 - Inside Docker, `127.0.0.1` means the container itself. Use `host.docker.internal` in `config.toml` for a proxy running on the host machine.
 - The image does not bake in `config.toml` or `email*.txt`; mount the project directory at `/data` so secrets and pool state stay on the host.
 - Mounting the whole pool directory also keeps `.email.lock` shared, so concurrent containers still serialize email moves correctly.
