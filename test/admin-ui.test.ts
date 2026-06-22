@@ -10,8 +10,18 @@ async function adminSource(): Promise<string> {
 test("sms config UI hides advanced HeroSMS fields", async () => {
     const source = await adminSource();
 
+    assert.match(source, /<span>待使用<\/span><button id="openImportModalBtn" type="button" class="secondary">导入<\/button>/);
+    assert.match(source, /<h2>任务<\/h2>/);
+    assert.doesNotMatch(source, /<h2>任务与邮箱<\/h2>/);
+    assert.doesNotMatch(source, />导入邮箱<\/button>/);
+    assert.match(source, /header \{[^}]*grid-template-columns: minmax\(0, 1fr\) auto minmax\(0, 1fr\)/);
+    assert.match(source, /\.runner-status-main \{[^}]*justify-self: center;[^}]*font-size: 15px/);
+    assert.match(source, /<span id="runnerStatus" class="status runner-status-main">idle<\/span>/);
+    assert.match(source, /class="row header-actions"/);
     assert.match(source, /id="successCostMeta"/);
     assert.match(source, /id="successRunMeta"/);
+    assert.match(source, /<span>成功<\/span><button id="exportBtn" type="button" class="secondary">导出<\/button>/);
+    assert.doesNotMatch(source, /导出成功邮箱与 CPA JSON/);
     assert.match(source, /#successCostMeta\s*\{[^}]*white-space:\s*pre-line/);
     assert.match(source, /avgSuccessIntervalMs/);
     assert.match(source, /本轮/);
@@ -40,6 +50,16 @@ test("sms config UI hides advanced HeroSMS fields", async () => {
     assert.doesNotMatch(source, /轮询间隔 ms/);
     assert.doesNotMatch(source, /最多轮询/);
     assert.doesNotMatch(source, /超时处理/);
+    assert.match(source, /logsFollowTail:\s*true/);
+    assert.match(source, /id="copyLogsBtn" type="button" class="secondary" hidden>复制<\/button>/);
+    assert.match(source, /\$\("copyLogsBtn"\)\.hidden = !state\.logsExpanded/);
+    assert.match(source, /async function copyVisibleLogs\(\)/);
+    assert.match(source, /navigator\.clipboard\.writeText\(text\)/);
+    assert.match(source, /\$\("copyLogsBtn"\)\.onclick = copyVisibleLogs/);
+    assert.match(source, /function updateLogFollowTail\(\)/);
+    assert.match(source, /\$\("logs"\)\.addEventListener\("scroll", updateLogFollowTail, \{passive: true\}\)/);
+    assert.match(source, /if \(shouldFollowTail\) \{/);
+    assert.match(source, /logBox\.scrollTop = previousScrollTop/);
 });
 
 test("sms config save payload preserves hidden config fields", async () => {
@@ -77,4 +97,17 @@ test("sms config save also persists only the run concurrency mode", async () => 
     for (const untouchedKey of ["total", "concurrency:", "adaptive_target_sms_rps_utilization", "adaptive_control_interval_ms"]) {
         assert.doesNotMatch(runValuesSource, new RegExp(untouchedKey));
     }
+});
+
+test("admin sessions persist without storing raw cookie tokens", async () => {
+    const source = await adminSource();
+
+    assert.match(source, /const SESSION_PERSIST_FILE = "\.admin-sessions\.json"/);
+    assert.match(source, /function sessionStorePath\(\)/);
+    assert.match(source, /FREE_REGISTER_SESSION_FILE/);
+    assert.match(source, /function hashSessionToken\(token: string\)/);
+    assert.match(source, /sessions\.set\(hashSessionToken\(token\), Date\.now\(\) \+ SESSION_TTL_MS\)/);
+    assert.match(source, /await loadPersistentSessions\(\)/);
+    assert.match(source, /tokenHash/);
+    assert.doesNotMatch(source, /sessions\.set\(token, Date\.now\(\) \+ SESSION_TTL_MS\)/);
 });

@@ -225,6 +225,22 @@ function withElapsed(worker: WorkerSnapshot): WorkerSnapshot {
     };
 }
 
+export function filterVisibleWorkerSnapshots(
+    workers: Iterable<WorkerSnapshot | null | undefined>,
+    concurrencyMode: RunConcurrencyMode,
+    liveAdaptiveWorkerIds: ReadonlySet<number> = new Set<number>(),
+): WorkerSnapshot[] {
+    const visible: WorkerSnapshot[] = [];
+    for (const worker of workers) {
+        if (!worker) continue;
+        if (concurrencyMode === "adaptive" && !liveAdaptiveWorkerIds.has(worker.workerId)) {
+            continue;
+        }
+        visible.push(worker);
+    }
+    return visible.sort((a, b) => a.workerId - b.workerId);
+}
+
 export function computeRunnerThroughput(
     snapshot: Pick<RunnerSnapshot, "status" | "startedAt" | "endedAt" | "okCount">,
     nowMs = Date.now(),
@@ -736,6 +752,8 @@ export class RegisterTaskRunner {
     private memoryMonitor: ReturnType<typeof setInterval> | null = null;
     private memoryGuardLevel: MemoryGuardLevel = "ok";
     private memoryConfig: AppConfig | null = null;
+    private readonly workerSnapshots = new Map<number, WorkerSnapshot>();
+    private readonly liveAdaptiveWorkerIds = new Set<number>();
 
     constructor(private readonly logger: RegisterLogger = DEFAULT_LOGGER) {}
 
@@ -753,6 +771,14 @@ export class RegisterTaskRunner {
         this.memoryGuardLevel = "ok";
         this.memoryConfig = config;
         this.abortController = new AbortController();
+        this.workerSnapshots.clear();
+        this.liveAdaptiveWorkerIds.clear();
+        const initialWorkers = config.run.concurrencyMode === "adaptive"
+            ? []
+            : Array.from({length: concurrency}, (_, index) => emptyWorkerSnapshot(index + 1));
+        for (const worker of initialWorkers) {
+            this.workerSnapshots.set(worker.workerId, worker);
+        }
         this.snapshot = {
             ...emptySnapshot(),
             status: "running",
@@ -767,9 +793,7 @@ export class RegisterTaskRunner {
             adaptiveTargetSmsRpsUtilization: config.run.concurrencyMode === "adaptive" ? config.run.adaptiveTargetSmsRpsUtilization : 0,
             startedAt: new Date().toISOString(),
             memory: runtimeMemorySnapshot(config),
-            workers: config.run.concurrencyMode === "adaptive"
-                ? []
-                : Array.from({length: concurrency}, (_, index) => emptyWorkerSnapshot(index + 1)),
+            workers: initialWorkers,
         };
 
         this.startMemoryMonitor(config);
@@ -786,7 +810,7 @@ export class RegisterTaskRunner {
                 this.snapshot.endedAt = new Date().toISOString();
                 this.snapshot.activeWorkers = 0;
                 this.snapshot.currentConcurrency = 0;
-                for (const worker of this.snapshot.workers) {
+                for (const worker of this.workerSnapshots.values()) {
                     if (worker.status === "running") {
                         this.updateWorker(worker.workerId, {
                             status: this.forcePauseRequested ? "force_paused" : "idle",
@@ -794,6 +818,10 @@ export class RegisterTaskRunner {
                             latestLog: this.forcePauseRequested ? "已强制暂停" : "已停止",
                         });
                     }
+                }
+                if (this.snapshot.concurrencyMode === "adaptive") {
+                    this.liveAdaptiveWorkerIds.clear();
+                    this.workerSnapshots.clear();
                 }
             });
 
@@ -830,7 +858,11 @@ export class RegisterTaskRunner {
         return {
             ...this.snapshot,
             ...throughput,
-            workers: this.snapshot.workers.map(withElapsed),
+            workers: filterVisibleWorkerSnapshots(
+                this.workerSnapshots.values(),
+                this.snapshot.concurrencyMode,
+                this.liveAdaptiveWorkerIds,
+            ).map(withElapsed),
         };
     }
 
@@ -880,15 +912,14 @@ export class RegisterTaskRunner {
     }
 
     private updateWorker(workerId: number, patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>): void {
-        const index = workerId - 1;
-        const existing = this.snapshot.workers[index] ?? emptyWorkerSnapshot(workerId);
+        const existing = this.workerSnapshots.get(workerId) ?? emptyWorkerSnapshot(workerId);
         const next = {
             ...existing,
             ...patch,
             workerId,
             updatedAt: new Date().toISOString(),
         };
-        this.snapshot.workers[index] = withElapsed(next);
+        this.workerSnapshots.set(workerId, withElapsed(next));
     }
 
     private refreshAdaptiveControl(config: AppConfig, baselineGuardUsedMb: number, previousRpsEwma: number): number {
@@ -941,6 +972,7 @@ export class RegisterTaskRunner {
         const spawnWorker = (): void => {
             const workerId = nextWorkerId + 1;
             nextWorkerId = workerId;
+            this.liveAdaptiveWorkerIds.add(workerId);
             this.updateWorker(workerId, {
                 status: "idle",
                 stage: "idle",
@@ -952,6 +984,8 @@ export class RegisterTaskRunner {
             const promise = runWorkerSafely(workerId, true)
                 .finally(() => {
                     activeWorkers.delete(workerId);
+                    this.liveAdaptiveWorkerIds.delete(workerId);
+                    this.workerSnapshots.delete(workerId);
                     this.snapshot.currentConcurrency = activeWorkers.size;
                 });
             activeWorkers.set(workerId, promise);

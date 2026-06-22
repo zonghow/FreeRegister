@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {computeAdaptiveTargetConcurrency, computeRunnerThroughput, estimateAdaptiveMaxConcurrency, type RunnerStatus} from "../src/runner.js";
+import {
+    computeAdaptiveTargetConcurrency,
+    computeRunnerThroughput,
+    estimateAdaptiveMaxConcurrency,
+    filterVisibleWorkerSnapshots,
+    type RunnerStatus,
+    type WorkerSnapshot,
+} from "../src/runner.js";
 
 function snapshot(status: RunnerStatus, startedAt: string, endedAt: string, okCount: number) {
     return {status, startedAt, endedAt, okCount};
@@ -115,5 +122,39 @@ test("adaptive target drains on slot backpressure and memory pressure", () => {
             controlIntervalMs: 5000,
         }),
         {targetConcurrency: 40, reason: "memory_high_drain"},
+    );
+});
+
+function worker(workerId: number, status: WorkerSnapshot["status"], latestLog = ""): WorkerSnapshot {
+    return {
+        workerId,
+        status,
+        stage: status === "running" ? "phone_acquire" : "idle",
+        jobId: workerId,
+        email: "",
+        phone: "",
+        proxy: "",
+        startedAt: "",
+        updatedAt: "",
+        elapsedMs: 0,
+        latestLog,
+        error: "",
+    };
+}
+
+test("adaptive worker snapshots only show live workers", () => {
+    const workers = [
+        worker(401, "idle", "自适应缩容，完成当前 job 后退出"),
+        worker(402, "running", "等待手机 OTP"),
+        worker(403, "idle", "自适应缩容，完成当前 job 后退出"),
+    ];
+
+    assert.deepEqual(
+        filterVisibleWorkerSnapshots(workers, "adaptive", new Set([402])).map((item) => item.workerId),
+        [402],
+    );
+    assert.deepEqual(
+        filterVisibleWorkerSnapshots(workers, "fixed").map((item) => item.workerId),
+        [401, 402, 403],
     );
 });

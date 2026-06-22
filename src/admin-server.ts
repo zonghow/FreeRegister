@@ -44,6 +44,9 @@ const MAX_LOG_BROADCAST_BATCH = 500;
 const MAX_SSE_WRITABLE_BUFFER_BYTES = 1024 * 1024;
 const SESSION_COOKIE = "fr_session";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const SESSION_STORE_VERSION = 1;
+const SESSION_PERSIST_FILE = ".admin-sessions.json";
+const SESSION_PERSIST_THROTTLE_MS = 30 * 1000;
 const HERO_SMS_BALANCE_TTL_MS = 30 * 1000;
 const HERO_SMS_BALANCE_TIMEOUT_MS = 5000;
 const HERO_SMS_COUNTRIES_TIMEOUT_MS = 10000;
@@ -192,6 +195,8 @@ class LogBuffer implements RegisterLogger {
 const logger = new LogBuffer();
 const runner = new RegisterTaskRunner(logger);
 const sessions = new Map<string, number>();
+let sessionPersistTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionPersistPromise: Promise<void> = Promise.resolve();
 let heroSmsBalanceCache: {key: string; expiresAt: number; value: JsonValue} | null = null;
 let heroSmsBalanceInFlight: {key: string; promise: Promise<JsonValue>} | null = null;
 let heroSmsCountriesCache: HeroSmsCountriesStatus | null = null;
@@ -253,6 +258,96 @@ function adminPort(): number {
     return Number.isFinite(port) && port > 0 ? port : DEFAULT_PORT;
 }
 
+function sessionStorePath(): string {
+    const configured = process.env.FREE_REGISTER_SESSION_FILE?.trim();
+    if (configured) return configured;
+    return path.join(path.dirname(configPath()), SESSION_PERSIST_FILE);
+}
+
+function hashSessionToken(token: string): string {
+    return createHash("sha256").update(adminPassword()).update("\0").update(token).digest("hex");
+}
+
+function pruneExpiredSessions(now = Date.now()): number {
+    let removed = 0;
+    for (const [tokenHash, expiresAt] of sessions) {
+        if (!Number.isFinite(expiresAt) || now > expiresAt) {
+            sessions.delete(tokenHash);
+            removed += 1;
+        }
+    }
+    return removed;
+}
+
+async function loadPersistentSessions(): Promise<void> {
+    const file = sessionStorePath();
+    try {
+        const raw = await readFile(file, "utf8");
+        const payload = JSON.parse(raw) as {
+            version?: unknown;
+            sessions?: unknown;
+        };
+        if (payload.version !== SESSION_STORE_VERSION || !Array.isArray(payload.sessions)) {
+            logger.warn(`[admin] session 文件格式不兼容，已忽略: ${file}`);
+            return;
+        }
+        const now = Date.now();
+        let loaded = 0;
+        for (const item of payload.sessions) {
+            if (!item || typeof item !== "object") continue;
+            const tokenHash = (item as {tokenHash?: unknown}).tokenHash;
+            const expiresAt = (item as {expiresAt?: unknown}).expiresAt;
+            if (typeof tokenHash !== "string" || !/^[a-f0-9]{64}$/i.test(tokenHash)) continue;
+            if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || now > expiresAt) continue;
+            sessions.set(tokenHash, expiresAt);
+            loaded += 1;
+        }
+        if (loaded > 0) {
+            logger.info(`[admin] 已恢复登录态 sessions=${loaded}`);
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        logger.warn(`[admin] session 文件读取失败，将重新登录: ${(error as Error).message}`);
+    }
+    if (pruneExpiredSessions() > 0) {
+        scheduleSessionPersist();
+    }
+}
+
+async function writePersistentSessions(): Promise<void> {
+    pruneExpiredSessions();
+    const payload = {
+        version: SESSION_STORE_VERSION,
+        updatedAt: new Date().toISOString(),
+        sessions: Array.from(sessions.entries()).map(([tokenHash, expiresAt]) => ({tokenHash, expiresAt})),
+    };
+    await writeFileAtomic(sessionStorePath(), `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function scheduleSessionPersist(): void {
+    if (sessionPersistTimer) return;
+    sessionPersistTimer = setTimeout(() => {
+        sessionPersistTimer = null;
+        flushSessionPersist();
+    }, SESSION_PERSIST_THROTTLE_MS);
+    sessionPersistTimer.unref?.();
+}
+
+async function flushSessionPersist(): Promise<void> {
+    if (sessionPersistTimer) {
+        clearTimeout(sessionPersistTimer);
+        sessionPersistTimer = null;
+    }
+    sessionPersistPromise = sessionPersistPromise
+        .catch(() => undefined)
+        .then(() => writePersistentSessions());
+    try {
+        await sessionPersistPromise;
+    } catch (error) {
+        logger.warn(`[admin] session 文件保存失败: ${(error as Error).message}`);
+    }
+}
+
 function safeEqual(a: string, b: string): boolean {
     const left = Buffer.from(createHash("sha256").update(a).digest("hex"));
     const right = Buffer.from(createHash("sha256").update(b).digest("hex"));
@@ -275,13 +370,16 @@ function parseCookies(req: IncomingMessage): Record<string, string> {
 function isAuthenticated(req: IncomingMessage): boolean {
     const token = parseCookies(req)[SESSION_COOKIE];
     if (!token) return false;
-    const expiresAt = sessions.get(token);
+    const tokenHash = hashSessionToken(token);
+    const expiresAt = sessions.get(tokenHash);
     if (!expiresAt) return false;
     if (Date.now() > expiresAt) {
-        sessions.delete(token);
+        sessions.delete(tokenHash);
+        scheduleSessionPersist();
         return false;
     }
-    sessions.set(token, Date.now() + SESSION_TTL_MS);
+    sessions.set(tokenHash, Date.now() + SESSION_TTL_MS);
+    scheduleSessionPersist();
     return true;
 }
 
@@ -894,7 +992,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
             return;
         }
         const token = randomBytes(32).toString("hex");
-        sessions.set(token, Date.now() + SESSION_TTL_MS);
+        sessions.set(hashSessionToken(token), Date.now() + SESSION_TTL_MS);
+        await flushSessionPersist();
         res.setHeader("set-cookie", `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
         sendJson(res, 200, {ok: true});
         return;
@@ -907,7 +1006,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
 
     if (pathname === "/api/logout" && req.method === "POST") {
         const token = parseCookies(req)[SESSION_COOKIE];
-        if (token) sessions.delete(token);
+        if (token) {
+            sessions.delete(hashSessionToken(token));
+            await flushSessionPersist();
+        }
         res.setHeader("set-cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
         sendJson(res, 200, {ok: true});
         return;
@@ -1110,8 +1212,9 @@ function html(): string {
     :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --text: #151515; --muted: #6f6f6a; --line: #dfdfda; --accent: #111111; --danger: #9f2a2a; }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.38 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); background: rgba(247,247,245,.9); position: sticky; top: 0; backdrop-filter: blur(12px); }
+    header { height: 52px; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px; padding: 0 18px; border-bottom: 1px solid var(--line); background: rgba(247,247,245,.9); position: sticky; top: 0; backdrop-filter: blur(12px); }
     h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
+    .header-actions { justify-self: end; }
     main { width: min(1280px, calc(100vw - 24px)); max-width: calc(100vw - 24px); min-width: 0; margin: 12px auto 28px; display: grid; gap: 10px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
     .panel { min-width: 0; max-width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
@@ -1129,6 +1232,7 @@ function html(): string {
     .sms-rps-item.disabled { color: var(--danger); }
     .metric-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
     .metric-actions button { height: 24px; padding: 0 7px; font-size: 11px; }
+    .metric-head button.secondary { height: 24px; padding: 0 7px; font-size: 11px; }
     .icon-button { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-color: var(--line); background: #fff; color: var(--text); line-height: 1; }
     .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -1167,7 +1271,7 @@ function html(): string {
     .cm-atom, .cm-number { color: #8a4d1c; }
     .cm-string { color: #1b6b68; }
     .cm-keyword, .cm-property { color: #403f3c; font-weight: 600; }
-    .worker-table-wrap { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    .worker-table-wrap { max-height: 980px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
     .worker-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .worker-table th, .worker-table td { padding: 6px 7px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .worker-table th { position: sticky; top: 0; z-index: 1; background: #fafafa; color: var(--muted); font-weight: 650; }
@@ -1196,9 +1300,10 @@ function html(): string {
     .modal textarea { min-height: 360px; }
     .muted { color: var(--muted); }
     .status { padding: 3px 8px; border-radius: 999px; background: #ececea; color: #333; font-size: 12px; }
+    .runner-status-main { justify-self: center; min-width: 128px; padding: 5px 14px; text-align: center; font-size: 15px; font-weight: 680; letter-spacing: 0; }
     .msg { min-height: 18px; color: var(--muted); }
     @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide, .form-grid .country-field, .form-grid .proxy-field { grid-column: span 2; } }
-    @media (max-width: 760px) { header { padding: 0 12px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .country-picker-row { grid-template-columns: 1fr; } }
+    @media (max-width: 760px) { header { padding: 0 12px; grid-template-columns: minmax(0, 1fr) auto auto; } .runner-status-main { min-width: 0; font-size: 13px; padding-inline: 9px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .country-picker-row { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -1212,15 +1317,15 @@ function html(): string {
   <section id="app">
     <header>
       <h1>FreeRegister Admin</h1>
-      <div class="row">
-        <span id="runnerStatus" class="status">idle</span>
+      <span id="runnerStatus" class="status runner-status-main">idle</span>
+      <div class="row header-actions">
         <button id="logoutBtn" class="secondary">退出</button>
       </div>
     </header>
     <main>
       <section class="grid">
-        <div class="panel metric">待使用<strong id="countSource">0</strong></div>
-        <div class="panel metric">成功<strong id="countSuccess">0</strong><span id="successCostMeta" class="sub"></span><span id="successRunMeta" class="sub"></span></div>
+        <div class="panel metric"><div class="metric-head"><span>待使用</span><button id="openImportModalBtn" type="button" class="secondary">导入</button></div><strong id="countSource">0</strong><span id="importMsg" class="sub"></span></div>
+        <div class="panel metric"><div class="metric-head"><span>成功</span><button id="exportBtn" type="button" class="secondary">导出</button></div><strong id="countSuccess">0</strong><span id="successCostMeta" class="sub"></span><span id="successRunMeta" class="sub"></span></div>
         <div class="panel metric"><span>进行中</span><strong id="countInflight">0</strong><div class="metric-actions"><button id="returnInflightBtn" type="button" class="secondary">归还</button><button id="failInflightBtn" type="button" class="secondary">标失败</button></div></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
@@ -1230,7 +1335,7 @@ function html(): string {
 
       <section class="panel stack">
         <div class="panel-head">
-          <h2>任务与邮箱</h2>
+          <h2>任务</h2>
           <span id="taskConfig" class="muted"></span>
         </div>
         <div class="split-row">
@@ -1238,12 +1343,9 @@ function html(): string {
             <button id="startBtn">开始</button>
             <button id="pauseBtn" class="secondary">暂停</button>
             <button id="forcePauseBtn" class="danger">强制暂停</button>
-            <button id="openImportModalBtn" class="secondary">导入邮箱</button>
-            <button id="exportBtn" class="secondary">导出成功邮箱与 CPA JSON</button>
           </div>
           <div class="row">
             <span id="taskMsg" class="msg"></span>
-            <span id="importMsg" class="msg"></span>
           </div>
         </div>
         <div class="panel-head">
@@ -1328,6 +1430,7 @@ function html(): string {
           <h2>日志</h2>
           <div class="row">
             <span id="logsState" class="muted">已折叠</span>
+            <button id="copyLogsBtn" type="button" class="secondary" hidden>复制</button>
             <button id="toggleLogsBtn" type="button" class="secondary" aria-expanded="false">展开</button>
           </div>
         </div>
@@ -1378,6 +1481,7 @@ function html(): string {
       lastLogStreamErrorAt: 0,
       maxVisibleLogs: 300,
       logsExpanded: false,
+      logsFollowTail: true,
       heroSmsBalanceRefreshing: false,
       inflightCount: 0,
       runnerBusy: false,
@@ -1932,15 +2036,26 @@ function html(): string {
       state.logFlushTimer = window.setTimeout(flushLogs, 300);
     }
 
+    function isLogNearBottom(logBox) {
+      return logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 48;
+    }
+
+    function updateLogFollowTail() {
+      if (!state.logsExpanded) return;
+      state.logsFollowTail = isLogNearBottom($("logs"));
+    }
+
     function renderLogBox() {
       const logBox = $("logs");
       logBox.textContent = state.logLines.join("\\n");
       logBox.scrollTop = logBox.scrollHeight;
+      state.logsFollowTail = true;
     }
 
     function setLogsExpanded(expanded) {
       state.logsExpanded = Boolean(expanded);
       $("logsBody").hidden = !state.logsExpanded;
+      $("copyLogsBtn").hidden = !state.logsExpanded;
       $("toggleLogsBtn").textContent = state.logsExpanded ? "折叠" : "展开";
       $("toggleLogsBtn").setAttribute("aria-expanded", String(state.logsExpanded));
       setText("logsState", state.logsExpanded ? "实时" : "已折叠" + (state.logLines.length ? " · " + state.logLines.length + " 行" : ""));
@@ -1956,7 +2071,8 @@ function html(): string {
       state.logFlushTimer = 0;
       if (!state.pendingLogs.length) return;
       const logBox = state.logsExpanded ? $("logs") : null;
-      const wasNearBottom = logBox ? logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 48 : false;
+      const shouldFollowTail = Boolean(logBox && state.logsFollowTail);
+      const previousScrollTop = logBox ? logBox.scrollTop : 0;
       state.logLines.push(...state.pendingLogs.splice(0));
       if (state.logLines.length > state.maxVisibleLogs) {
         state.logLines.splice(0, state.logLines.length - state.maxVisibleLogs);
@@ -1966,8 +2082,24 @@ function html(): string {
         return;
       }
       logBox.textContent = state.logLines.join("\\n");
-      if (wasNearBottom && logBox) {
+      if (shouldFollowTail) {
         logBox.scrollTop = logBox.scrollHeight;
+      } else {
+        logBox.scrollTop = previousScrollTop;
+      }
+    }
+
+    async function copyVisibleLogs() {
+      try {
+        const text = $("logs").textContent || "";
+        if (!text) {
+          setText("logsState", "暂无日志可复制");
+          return;
+        }
+        await navigator.clipboard.writeText(text);
+        setText("logsState", "已复制 " + state.logLines.length + " 行");
+      } catch (error) {
+        setText("logsState", "复制失败：" + (error.message || error));
       }
     }
 
@@ -2083,6 +2215,8 @@ function html(): string {
     );
 
     $("smsCountrySearch").addEventListener("input", renderCountryPicker);
+    $("logs").addEventListener("scroll", updateLogFollowTail, {passive: true});
+    $("copyLogsBtn").onclick = copyVisibleLogs;
     $("toggleLogsBtn").onclick = () => setLogsExpanded(!state.logsExpanded);
     $("refreshHeroSmsBalanceBtn").onclick = refreshHeroSmsBalance;
     $("openImportModalBtn").onclick = openImportModal;
@@ -2211,6 +2345,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
 async function main(): Promise<void> {
     installConsoleCapture();
+    await loadPersistentSessions();
     const port = adminPort();
     if (adminPassword() === "changeme") {
         logger.warn("[admin] FREE_REGISTER_ADMIN_PASSWORD 未设置，当前使用默认密码 changeme");

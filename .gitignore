@@ -11,6 +11,7 @@ email.success.txt
 email.inflight.txt
 email.failed.txt
 .email.lock
+.admin-sessions.json
 cost.success.jsonl
 .cost.lock
 auth/

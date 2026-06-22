@@ -143,6 +143,7 @@ docker compose up --build -d
 
 Docker 运行时会把项目目录挂载到 `/data`，因此 `config.toml`、邮箱池和 `cpa_json/` 都保存在宿主机项目目录中。
 Compose 默认通过 `NODE_OPTIONS=--max-old-space-size=12288` 给 Node 12GB heap；可以用 `FREE_REGISTER_NODE_HEAP_MB=8192` 这类环境变量调整。
+后台登录态会持久化到 `config.toml` 同目录下的 `.admin-sessions.json`，因此容器重启后不会要求重新登录；如果修改了 `FREE_REGISTER_ADMIN_PASSWORD`，旧登录态会自动失效。需要自定义位置时可设置 `FREE_REGISTER_SESSION_FILE=/data/.admin-sessions.json`。
 
 更多 Docker 命令见 [DOCKER.md](./DOCKER.md)。
 
