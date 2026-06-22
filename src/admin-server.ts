@@ -4,7 +4,7 @@ import {mkdir, readFile, readdir, rename, stat, writeFile} from "node:fs/promise
 import path from "node:path";
 import JSZip from "jszip";
 import {EmailPool, emailFromLine} from "./email-pool.js";
-import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig} from "./config.js";
+import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
 
@@ -374,14 +374,14 @@ async function writeFileAtomic(filePath: string, content: string): Promise<void>
     await rename(tmpPath, filePath);
 }
 
-function formatTomlValue(value: string | number | boolean | number[]): string {
-    if (Array.isArray(value)) return `[${value.join(", ")}]`;
+function formatTomlValue(value: string | number | boolean | string[] | number[]): string {
+    if (Array.isArray(value)) return `[${value.map((item) => typeof item === "string" ? JSON.stringify(item) : String(item)).join(", ")}]`;
     if (typeof value === "string") return JSON.stringify(value);
     if (typeof value === "boolean") return value ? "true" : "false";
     return String(value);
 }
 
-function upsertTomlSection(raw: string, section: string, values: Record<string, string | number | boolean | number[]>, removeKeys: string[] = []): string {
+function upsertTomlSection(raw: string, section: string, values: Record<string, string | number | boolean | string[] | number[]>, removeKeys: string[] = []): string {
     const lines = raw.split(/\r?\n/);
     const sectionHeader = `[${section}]`;
     const sectionStart = lines.findIndex((line) => line.trim() === sectionHeader);
@@ -425,6 +425,7 @@ function smsConfigJson(config: AppConfig): JsonValue {
     return {
         ...config.heroSMS,
         countries: config.heroSMS.countries,
+        proxyUrls: config.heroSMS.proxyUrls,
         pollAttempts: fixedHeroSmsPollAttempts(config.heroSMS.pollIntervalMs),
     } as unknown as JsonValue;
 }
@@ -456,6 +457,30 @@ function priorityFromBody(value: unknown, fallback: HeroSMSConfig["acquirePriori
     const normalized = String(value ?? "").trim();
     if (normalized === "country" || normalized === "price_low" || normalized === "price_high") return normalized;
     return fallback;
+}
+
+function proxyStrategyFromBody(value: unknown, fallback: HeroSMSProxyStrategy): HeroSMSProxyStrategy {
+    const normalized = String(value ?? "").trim();
+    if (normalized === "hero_sms" || normalized === "proxies" || normalized === "direct") return normalized;
+    return fallback;
+}
+
+function proxyUrlsFromBody(value: unknown, fallback: string[]): string[] {
+    if (value == null) return fallback;
+    const source = Array.isArray(value)
+        ? value
+        : typeof value === "string"
+            ? value.split(/\r?\n|,/)
+            : [];
+    const seen = new Set<string>();
+    const urls: string[] = [];
+    for (const item of source) {
+        const url = String(item ?? "").trim();
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        urls.push(url);
+    }
+    return urls;
 }
 
 function publicConfigSummary(config: AppConfig): JsonValue {
@@ -882,7 +907,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
         const values = {
             api_key: typeof body.apiKey === "string" ? body.apiKey.trim() : hero.apiKey,
-            use_proxy: Boolean(body.useProxy),
+            proxy_strategy: proxyStrategyFromBody(body.proxyStrategy, hero.proxyStrategy),
+            proxy_urls: proxyUrlsFromBody(body.proxyUrls, hero.proxyUrls),
             countries: countriesFromBody(body.countries, hero.countries),
             acquire_priority: priorityFromBody(body.acquirePriority, hero.acquirePriority),
             min_price: Math.min(minPrice, maxPrice),
@@ -899,7 +925,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-        const nextContent = upsertTomlSection(content, "hero_sms", values, ["country", "price_tiers", "poll_attempts"]);
+        const nextContent = upsertTomlSection(content, "hero_sms", values, ["country", "price_tiers", "poll_attempts", "use_proxy"]);
         parseToml(nextContent);
         await writeFileAtomic(file, nextContent);
         heroSmsBalanceCache = null;
@@ -1018,9 +1044,10 @@ function html(): string {
     select { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; min-width: 120px; }
     label { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
     label span { color: var(--muted); }
-    label input, label select { color: var(--text); font-size: 13px; }
+    label input, label select, label textarea { color: var(--text); font-size: 13px; }
     .form-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; align-items: end; }
     .form-grid .wide { grid-column: span 2; }
+    .form-grid .proxy-field { grid-column: span 3; }
     .readonly-field { display: flex; align-items: center; min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); color: var(--text); font-size: 13px; }
     .check-row { height: 30px; display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
     .check-row input { min-width: 0; width: 15px; height: 15px; }
@@ -1031,6 +1058,7 @@ function html(): string {
     .country-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; background: #fafafa; }
     .country-pill button { width: 22px; height: 22px; padding: 0; border-color: var(--line); background: #fff; color: var(--text); }
     textarea { width: 100%; min-height: 160px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.42; }
+    .form-grid textarea { min-height: 72px; max-height: 120px; padding: 7px 8px; border-radius: 6px; }
     #configText { min-height: 330px; }
     .CodeMirror { height: 340px; border: 1px solid var(--line); border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.42; }
     .CodeMirror-scroll { border-radius: 8px; }
@@ -1070,7 +1098,7 @@ function html(): string {
     .muted { color: var(--muted); }
     .status { padding: 3px 8px; border-radius: 999px; background: #ececea; color: #333; font-size: 12px; }
     .msg { min-height: 18px; color: var(--muted); }
-    @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide, .form-grid .country-field { grid-column: span 2; } }
+    @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide, .form-grid .country-field, .form-grid .proxy-field { grid-column: span 2; } }
     @media (max-width: 760px) { header { padding: 0 12px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .country-picker-row { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -1147,12 +1175,17 @@ function html(): string {
         </div>
         <div class="form-grid">
           <label class="wide"><span>HeroSMS API Key</span><input id="smsApiKey" autocomplete="off"></label>
-          <label><span>接口代理</span><span class="check-row"><input id="smsUseProxy" type="checkbox">走代理池</span></label>
+          <label><span>接口代理策略</span><select id="smsProxyStrategy">
+            <option value="hero_sms">专用代理</option>
+            <option value="proxies">共用代理池</option>
+            <option value="direct">不走代理</option>
+          </select></label>
           <label><span>取号策略</span><select id="smsAcquirePriority">
             <option value="country">国家优先</option>
             <option value="price_low">低价优先</option>
             <option value="price_high">高价优先</option>
           </select></label>
+          <label class="proxy-field"><span>HeroSMS 专用代理</span><textarea id="smsProxyUrls" spellcheck="false" placeholder="每行一个代理 URL"></textarea></label>
           <label><span>最低价格</span><input id="smsMinPrice" type="number" min="0" step="0.0001"></label>
           <label><span>最高价格</span><input id="smsMaxPrice" type="number" min="0" step="0.0001"></label>
           <label><span>价格档位</span><input id="smsPriceStep" type="number" min="0" step="0.0001"></label>
@@ -1518,8 +1551,24 @@ function html(): string {
       setText("smsPollAttempts", fixedSmsPollAttempts(value) + " 次");
     }
 
+    function normalizeSmsProxyStrategy(hero) {
+      if (hero && (hero.proxyStrategy === "hero_sms" || hero.proxyStrategy === "proxies" || hero.proxyStrategy === "direct")) {
+        return hero.proxyStrategy;
+      }
+      return hero && hero.useProxy === true ? "proxies" : "direct";
+    }
+
+    function updateSmsProxyControls() {
+      const dedicated = $("smsProxyStrategy").value === "hero_sms";
+      $("smsProxyUrls").disabled = !dedicated;
+      $("smsProxyUrls").placeholder = dedicated ? "每行一个代理 URL" : "仅选择专用代理时使用";
+    }
+
     function fillSmsForm(hero) {
       setInputValue("smsApiKey", hero.apiKey || "");
+      $("smsProxyStrategy").value = normalizeSmsProxyStrategy(hero);
+      setInputValue("smsProxyUrls", Array.isArray(hero.proxyUrls) ? hero.proxyUrls.join("\\n") : "");
+      updateSmsProxyControls();
       $("smsAcquirePriority").value = hero.acquirePriority || "country";
       setInputValue("smsMinPrice", hero.minPrice);
       setInputValue("smsMaxPrice", hero.maxPrice);
@@ -1527,7 +1576,6 @@ function html(): string {
       setInputValue("smsMaxPhoneTries", hero.maxPhoneTries);
       setInputValue("smsPollIntervalMs", hero.pollIntervalMs);
       updateSmsPollAttemptsLabel(hero.pollIntervalMs);
-      $("smsUseProxy").checked = hero.useProxy === true;
       $("smsAutoRelease").checked = hero.autoReleaseOnTimeout !== false;
       state.selectedSmsCountries = Array.isArray(hero.countries) ? hero.countries.map(Number).filter(Boolean) : [];
       renderSelectedCountries();
@@ -1557,7 +1605,8 @@ function html(): string {
         priceStep: Number($("smsPriceStep").value),
         maxPhoneTries: Number($("smsMaxPhoneTries").value),
         pollIntervalMs: Number($("smsPollIntervalMs").value),
-        useProxy: $("smsUseProxy").checked,
+        proxyStrategy: $("smsProxyStrategy").value,
+        proxyUrls: $("smsProxyUrls").value.split(/\\r?\\n|,/).map((item) => item.trim()).filter(Boolean),
         autoReleaseOnTimeout: $("smsAutoRelease").checked
       };
     }
@@ -1818,6 +1867,7 @@ function html(): string {
     );
 
     $("smsPollIntervalMs").addEventListener("input", () => updateSmsPollAttemptsLabel($("smsPollIntervalMs").value));
+    $("smsProxyStrategy").addEventListener("change", updateSmsProxyControls);
     $("smsCountrySearch").addEventListener("input", renderCountryPicker);
     $("toggleLogsBtn").onclick = () => setLogsExpanded(!state.logsExpanded);
     $("refreshHeroSmsBalanceBtn").onclick = refreshHeroSmsBalance;

@@ -18,10 +18,14 @@ save_auth_json = false
 # HeroSMS 接码配置。
 # countries 按顺序尝试；网页国家选项会优先从 HeroSMS getCountries 接口获取并永久缓存。
 # acquire_priority 可选 country / price_low / price_high。
+# proxy_strategy 可选：
+#   "hero_sms" 使用 proxy_urls 专用代理池
+#   "proxies" 复用 [proxies].urls 代理池
+#   "direct" 不走代理
 [hero_sms]
 api_key = ""
-# true 时 HeroSMS 取号、查码、释放号码、余额和国家列表接口都会走 [proxies].urls。
-use_proxy = false
+proxy_strategy = "direct"
+proxy_urls = []
 countries = [33]
 acquire_priority = "country"
 min_price = 0.45

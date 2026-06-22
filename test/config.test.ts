@@ -19,6 +19,8 @@ urls = ["socks5://a", "http://b"]
 [hero_sms]
 countries = [33, 52]
 acquire_priority = "price_high"
+proxy_strategy = "hero_sms"
+proxy_urls = ["socks5://hero-a", "socks5://hero-b"]
 min_price = 0.04
 max_price = 0.08
 price_step = 0.02
@@ -32,6 +34,8 @@ auto_release_on_timeout = true
     assert.deepEqual(parsed.proxies.urls, ["socks5://a", "http://b"]);
     assert.deepEqual(parsed.hero_sms.countries, [33, 52]);
     assert.equal(parsed.hero_sms.acquire_priority, "price_high");
+    assert.equal(parsed.hero_sms.proxy_strategy, "hero_sms");
+    assert.deepEqual(parsed.hero_sms.proxy_urls, ["socks5://hero-a", "socks5://hero-b"]);
     assert.equal(parsed.hero_sms.auto_release_on_timeout, true);
 });
 
@@ -54,7 +58,8 @@ save_auth_json = true
 
 [hero_sms]
 api_key = "hero"
-use_proxy = true
+proxy_strategy = "hero_sms"
+proxy_urls = ["socks5://hero-one", "socks5://hero-two"]
 countries = [33, 52]
 acquire_priority = "price_low"
 min_price = 0.04
@@ -85,6 +90,8 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.maxPhoneTries, 7);
         assert.equal(overridden.run.memorySoftLimitMb, 7000);
         assert.equal(overridden.run.memoryHardLimitMb, 8000);
+        assert.equal(overridden.heroSMS.proxyStrategy, "hero_sms");
+        assert.deepEqual(overridden.heroSMS.proxyUrls, ["socks5://hero-one", "socks5://hero-two"]);
         assert.equal(overridden.heroSMS.useProxy, true);
         assert.deepEqual(overridden.heroSMS.countries, [33, 52]);
         assert.equal(overridden.heroSMS.acquirePriority, "price_low");
@@ -100,11 +107,37 @@ file = "custom-sdk.js"
         assert.equal(proxyForWorker(overridden, 0), "socks5://one");
         assert.equal(proxyForWorker(overridden, 1), "socks5://two");
         assert.equal(proxyForWorker(overridden, 2), "socks5://one");
-        assert.equal(heroSmsProxyForWorker(overridden, 0), "socks5://one");
-        assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, useProxy: false}}, 0), "");
+        assert.equal(heroSmsProxyForWorker(overridden, 0), "socks5://hero-one");
+        assert.equal(heroSmsProxyForWorker(overridden, 1), "socks5://hero-two");
+        assert.equal(heroSmsProxyForWorker(overridden, 2), "socks5://hero-one");
+        assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "proxies"}}, 1), "socks5://two");
+        assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "direct"}}, 0), "");
         assert.equal(overridden.cpaJson.dir, path.join(dir, "custom-cpa"));
         assert.equal(overridden.sentinelSdk.url, "https://example.com/sdk.js");
         assert.equal(overridden.sentinelSdk.file, "custom-sdk.js");
+    } finally {
+        await rm(dir, {recursive: true, force: true});
+    }
+});
+
+test("keeps legacy hero sms use_proxy compatibility", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-config-legacy-proxy-"));
+    try {
+        const configPath = path.join(dir, "config.toml");
+        await writeFile(configPath, `
+[hero_sms]
+use_proxy = true
+
+[proxies]
+urls = ["socks5://shared-one", "socks5://shared-two"]
+`);
+
+        const loaded = loadConfig(configPath);
+
+        assert.equal(loaded.heroSMS.proxyStrategy, "proxies");
+        assert.equal(loaded.heroSMS.useProxy, true);
+        assert.equal(heroSmsProxyForWorker(loaded, 0), "socks5://shared-one");
+        assert.equal(heroSmsProxyForWorker(loaded, 1), "socks5://shared-two");
     } finally {
         await rm(dir, {recursive: true, force: true});
     }

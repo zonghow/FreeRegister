@@ -38,7 +38,8 @@ cp config.example.toml config.toml
 ```toml
 [hero_sms]
 api_key = "your-hero-sms-api-key"
-use_proxy = false
+proxy_strategy = "direct"
+proxy_urls = []
 
 [proxies]
 urls = []
@@ -154,7 +155,8 @@ save_auth_json = false
 
 [hero_sms]
 api_key = ""
-use_proxy = false
+proxy_strategy = "direct"
+proxy_urls = []
 countries = [33]
 acquire_priority = "country"
 min_price = 0.45
@@ -188,11 +190,21 @@ urls = []
 
 `auto_release_on_timeout = true` 时，如果一个号码在固定轮询窗口内仍未收到验证码，会主动调用 HeroSMS 取消/释放该号码，然后换新号。最多轮询次数不支持配置，程序会按 `poll_interval_ms` 自动计算到超过 2 分钟；默认 `3000ms` 间隔下是 42 次。
 
-`use_proxy = true` 时，HeroSMS 的取号、查码、释放号码、余额和国家列表接口都会走 `[proxies].urls`；注册任务中按 worker 轮询代理，后台余额和国家列表使用第一个代理。
+HeroSMS 的取号、查码、释放号码、余额和国家列表接口都按 `proxy_strategy` 走网络：
 
-代理只从 `[proxies].urls` 读取。留空表示直连；配置多个代理时会按 worker 轮询负载均衡：
+- `hero_sms`：使用 `[hero_sms].proxy_urls` 专用代理池，注册任务中按 worker 轮询代理，后台余额和国家列表使用第一个专用代理。
+- `proxies`：复用 `[proxies].urls`，和 OpenAI/邮箱链路使用同一套代理池。
+- `direct`：HeroSMS 接口不走代理。
+
+OpenAI/邮箱链路仍只从 `[proxies].urls` 读取。留空表示直连；配置多个代理时会按 worker 轮询负载均衡：
 
 ```toml
+[hero_sms]
+proxy_strategy = "hero_sms"
+proxy_urls = [
+  "socks5://127.0.0.1:7891"
+]
+
 [proxies]
 urls = [
   "socks5://127.0.0.1:7890",

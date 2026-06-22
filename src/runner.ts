@@ -424,6 +424,7 @@ export async function runOne(
 ): Promise<JobResult> {
     throwIfForcePaused(signal);
     const proxyUrl = proxyForWorker(config, workerId - 1);
+    const smsProxyUrl = heroSmsProxyForWorker(config, workerId - 1);
     const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(config.run.total);
     updateWorker?.({
         status: "running",
@@ -436,7 +437,7 @@ export async function runOne(
         latestLog: `job ${jobId}/${totalLabel} 开始`,
         error: "",
     });
-    logger.info(`\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxy=${redactProxy(proxyUrl)} ==========`);
+    logger.info(`\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxy=${redactProxy(proxyUrl)} heroSmsProxy=${redactProxy(smsProxyUrl)} ==========`);
 
     const emailLease = await pool.leaseEmail();
     if (!emailLease) {

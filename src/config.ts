@@ -19,6 +19,8 @@ export interface OpenAIConfig {
 
 export interface HeroSMSConfig {
     apiKey: string;
+    proxyStrategy: HeroSMSProxyStrategy;
+    proxyUrls: string[];
     useProxy: boolean;
     countries: number[];
     acquirePriority: "country" | "price_low" | "price_high";
@@ -64,6 +66,7 @@ export interface AppConfig {
     defaultPassword: string;
 }
 
+export type HeroSMSProxyStrategy = "hero_sms" | "proxies" | "direct";
 type TomlValue = string | number | boolean | string[] | number[];
 type TomlObject = Record<string, Record<string, TomlValue>>;
 
@@ -83,6 +86,8 @@ const DEFAULT_CONFIG: AppConfig = {
     },
     heroSMS: {
         apiKey: "",
+        proxyStrategy: "direct",
+        proxyUrls: [],
         useProxy: false,
         countries: [33],
         acquirePriority: "country",
@@ -264,6 +269,17 @@ function normalizeAcquirePriority(value: TomlValue | undefined, fallback: HeroSM
     return fallback;
 }
 
+function normalizeHeroSmsProxyStrategy(
+    value: TomlValue | undefined,
+    legacyUseProxy: boolean,
+): HeroSMSProxyStrategy {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (["hero_sms", "herosms", "dedicated", "dedicated_proxy"].includes(normalized)) return "hero_sms";
+    if (["proxies", "proxy_pool", "shared"].includes(normalized)) return "proxies";
+    if (["direct", "none", "off", "no_proxy"].includes(normalized)) return "direct";
+    return legacyUseProxy ? "proxies" : DEFAULT_CONFIG.heroSMS.proxyStrategy;
+}
+
 function pathValue(value: TomlValue | undefined, fallback: string, baseDir: string): string {
     const raw = stringValue(value, fallback);
     return path.isAbsolute(raw) ? raw : path.resolve(baseDir, raw);
@@ -380,6 +396,8 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         DEFAULT_CONFIG.heroSMS.minPrice,
     );
     const maxPrice = positiveNumber(numberValue(hero.max_price, DEFAULT_CONFIG.heroSMS.maxPrice), DEFAULT_CONFIG.heroSMS.maxPrice);
+    const legacyUseProxy = booleanValue(hero.use_proxy, DEFAULT_CONFIG.heroSMS.useProxy);
+    const heroSmsProxyStrategy = normalizeHeroSmsProxyStrategy(hero.proxy_strategy, legacyUseProxy);
 
     const config: AppConfig = {
         run: {
@@ -394,7 +412,9 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         openai: openAIConfig,
         heroSMS: {
             apiKey: stringValue(hero.api_key, DEFAULT_CONFIG.heroSMS.apiKey),
-            useProxy: booleanValue(hero.use_proxy, DEFAULT_CONFIG.heroSMS.useProxy),
+            proxyStrategy: heroSmsProxyStrategy,
+            proxyUrls: stringArrayValue(hero.proxy_urls),
+            useProxy: heroSmsProxyStrategy !== "direct",
             countries: configuredCountries.length ? configuredCountries : [legacyCountry],
             acquirePriority: normalizeAcquirePriority(hero.acquire_priority, DEFAULT_CONFIG.heroSMS.acquirePriority),
             minPrice,
@@ -472,7 +492,11 @@ export function proxyForWorker(config: AppConfig, workerIndex: number): string {
 }
 
 export function heroSmsProxyForWorker(config: AppConfig, workerIndex: number): string {
-    return config.heroSMS.useProxy ? proxyForWorker(config, workerIndex) : "";
+    if (config.heroSMS.proxyStrategy === "direct") return "";
+    if (config.heroSMS.proxyStrategy === "proxies") return proxyForWorker(config, workerIndex);
+    const urls = config.heroSMS.proxyUrls;
+    if (!urls.length) return "";
+    return urls[workerIndex % urls.length];
 }
 
 export function redactProxy(proxyUrl: string): string {
