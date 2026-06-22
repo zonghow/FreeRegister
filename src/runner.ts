@@ -5,6 +5,7 @@ import {generateRandomDeviceProfile} from "./device-profile.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
 import {OpenAIClient} from "./openai.js";
 import {createSMSBroker} from "./sms/index.js";
+import {formatUtc8Timestamp} from "./utils.js";
 
 export interface JobResult {
     ok: boolean;
@@ -197,11 +198,13 @@ type WorkerUpdate = (patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs
 
 function createBroker(config: AppConfig, proxyUrl: string) {
     const hero = config.heroSMS;
-    if (!hero.apiKey) {
-        throw new Error("缺少 [hero_sms].api_key");
+    if (!hero.apiKeys.length) {
+        throw new Error("缺少 [hero_sms].api_keys 或 [hero_sms].api_key");
     }
     return createSMSBroker({
-        apiKey: hero.apiKey,
+        apiKeys: hero.apiKeys,
+        apiKeyStrategy: hero.apiKeyStrategy,
+        rpsLimit: hero.rpsLimit,
         proxyUrl,
         pollIntervalMs: hero.pollIntervalMs,
         countries: hero.countries,
@@ -366,7 +369,7 @@ async function bindEmailViaOAuth(
                 phone,
                 latestLog: "等待邮箱 OTP",
             });
-            logger.info(`[worker-${workerId}] [email] 等待 OTP for ${bindEmail} (after=${new Date(startedAt).toISOString()})`);
+            logger.info(`[worker-${workerId}] [email] 等待 OTP for ${bindEmail} (after=${formatUtc8Timestamp(startedAt)})`);
             const code = await hotmailProvider.getEmailVerificationCode(bindEmail, {minTimestampMs: startedAt, signal});
             throwIfForcePaused(signal);
             updateWorker?.({

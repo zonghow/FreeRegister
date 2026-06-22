@@ -19,6 +19,9 @@ urls = ["socks5://a", "http://b"]
 [hero_sms]
 countries = [33, 52]
 acquire_priority = "price_high"
+api_keys = ["hero-a", "hero-b"]
+api_key_strategy = "fill_first"
+rps_limit = 7
 proxy_strategy = "hero_sms"
 proxy_urls = ["socks5://hero-a", "socks5://hero-b"]
 min_price = 0.04
@@ -34,6 +37,9 @@ auto_release_on_timeout = true
     assert.deepEqual(parsed.proxies.urls, ["socks5://a", "http://b"]);
     assert.deepEqual(parsed.hero_sms.countries, [33, 52]);
     assert.equal(parsed.hero_sms.acquire_priority, "price_high");
+    assert.deepEqual(parsed.hero_sms.api_keys, ["hero-a", "hero-b"]);
+    assert.equal(parsed.hero_sms.api_key_strategy, "fill_first");
+    assert.equal(parsed.hero_sms.rps_limit, 7);
     assert.equal(parsed.hero_sms.proxy_strategy, "hero_sms");
     assert.deepEqual(parsed.hero_sms.proxy_urls, ["socks5://hero-a", "socks5://hero-b"]);
     assert.equal(parsed.hero_sms.auto_release_on_timeout, true);
@@ -57,7 +63,10 @@ default_password = "pw"
 save_auth_json = true
 
 [hero_sms]
-api_key = "hero"
+api_key = "legacy-hero"
+api_keys = ["hero-one", "hero-two"]
+api_key_strategy = "fill_first"
+rps_limit = 3
 proxy_strategy = "hero_sms"
 proxy_urls = ["socks5://hero-one", "socks5://hero-two"]
 countries = [33, 52]
@@ -90,6 +99,10 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.maxPhoneTries, 7);
         assert.equal(overridden.run.memorySoftLimitMb, 7000);
         assert.equal(overridden.run.memoryHardLimitMb, 8000);
+        assert.equal(overridden.heroSMS.apiKey, "hero-one");
+        assert.deepEqual(overridden.heroSMS.apiKeys, ["hero-one", "hero-two"]);
+        assert.equal(overridden.heroSMS.apiKeyStrategy, "fill_first");
+        assert.equal(overridden.heroSMS.rpsLimit, 3);
         assert.equal(overridden.heroSMS.proxyStrategy, "hero_sms");
         assert.deepEqual(overridden.heroSMS.proxyUrls, ["socks5://hero-one", "socks5://hero-two"]);
         assert.equal(overridden.heroSMS.useProxy, true);
@@ -143,6 +156,27 @@ urls = ["socks5://shared-one", "socks5://shared-two"]
     }
 });
 
+test("keeps legacy hero sms api_key compatibility and defaults invalid strategy", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-config-legacy-key-"));
+    try {
+        const configPath = path.join(dir, "config.toml");
+        await writeFile(configPath, `
+[hero_sms]
+api_key = "legacy-key"
+api_key_strategy = "surprise"
+`);
+
+        const loaded = loadConfig(configPath);
+
+        assert.equal(loaded.heroSMS.apiKey, "legacy-key");
+        assert.deepEqual(loaded.heroSMS.apiKeys, ["legacy-key"]);
+        assert.equal(loaded.heroSMS.apiKeyStrategy, "round_robin");
+        assert.equal(loaded.heroSMS.rpsLimit, 40);
+    } finally {
+        await rm(dir, {recursive: true, force: true});
+    }
+});
+
 test("applies docker-oriented env overrides", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-config-env-"));
     const previousEnv = {
@@ -188,6 +222,7 @@ urls = ["socks5://from-file"]
 
         assert.deepEqual(loaded.proxies, ["socks5://from-file"]);
         assert.equal(loaded.heroSMS.apiKey, "from-env");
+        assert.deepEqual(loaded.heroSMS.apiKeys, ["from-env"]);
         assert.equal(loaded.openai.defaultPassword, "env-password");
         assert.equal(loaded.openai.saveAuthJson, true);
         assert.equal(loaded.run.runUntilEmpty, true);

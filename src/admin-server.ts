@@ -7,6 +7,7 @@ import {EmailPool, emailFromLine} from "./email-pool.js";
 import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
+import {formatUtc8Timestamp} from "./utils.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | {[key: string]: JsonValue};
 type LogLevel = "info" | "warn" | "error";
@@ -121,7 +122,7 @@ class LogBuffer implements RegisterLogger {
     }
 
     private add(level: LogLevel, message: string): void {
-        const time = new Date().toISOString();
+        const time = formatUtc8Timestamp();
         for (const line of String(message).split(/\r?\n/)) {
             const entry = {
                 id: this.nextId,
@@ -424,10 +425,17 @@ function upsertTomlSection(raw: string, section: string, values: Record<string, 
 function smsConfigJson(config: AppConfig): JsonValue {
     return {
         ...config.heroSMS,
+        apiKey: config.heroSMS.apiKey ? redactHeroSmsApiKey(config.heroSMS.apiKey, 0) : "",
+        apiKeys: config.heroSMS.apiKeys.map(redactHeroSmsApiKey),
         countries: config.heroSMS.countries,
         proxyUrls: config.heroSMS.proxyUrls,
         pollAttempts: fixedHeroSmsPollAttempts(config.heroSMS.pollIntervalMs),
     } as unknown as JsonValue;
+}
+
+function redactHeroSmsApiKey(apiKey: string, index: number): string {
+    const tail = String(apiKey ?? "").trim().slice(-4) || "empty";
+    return `Key #${index + 1} ****${tail}`;
 }
 
 function numberFromBody(value: unknown, fallback: number): number {
@@ -465,24 +473,6 @@ function proxyStrategyFromBody(value: unknown, fallback: HeroSMSProxyStrategy): 
     return fallback;
 }
 
-function proxyUrlsFromBody(value: unknown, fallback: string[]): string[] {
-    if (value == null) return fallback;
-    const source = Array.isArray(value)
-        ? value
-        : typeof value === "string"
-            ? value.split(/\r?\n|,/)
-            : [];
-    const seen = new Set<string>();
-    const urls: string[] = [];
-    for (const item of source) {
-        const url = String(item ?? "").trim();
-        if (!url || seen.has(url)) continue;
-        seen.add(url);
-        urls.push(url);
-    }
-    return urls;
-}
-
 function publicConfigSummary(config: AppConfig): JsonValue {
     return {
         run: config.run as unknown as JsonValue,
@@ -495,9 +485,13 @@ function publicConfigSummary(config: AppConfig): JsonValue {
 
 function heroSmsBalanceCacheKey(config: AppConfig): string {
     return createHash("sha256")
-        .update(config.heroSMS.apiKey)
+        .update(config.heroSMS.apiKeys.join("\0"))
         .update("\0")
-        .update(heroSmsProxyForWorker(config, 0))
+        .update(config.heroSMS.proxyStrategy)
+        .update("\0")
+        .update(config.heroSMS.proxyUrls.join("\0"))
+        .update("\0")
+        .update(config.proxies.join("\0"))
         .digest("hex");
 }
 
@@ -586,7 +580,7 @@ async function writeHeroSmsCountriesCache(status: HeroSmsCountriesStatus): Promi
 
 async function fetchHeroSmsCountries(config: AppConfig): Promise<HeroSmsCountriesStatus> {
     const provider = createHeroSmsProvider({
-        apiKey: config.heroSMS.apiKey,
+        apiKey: config.heroSMS.apiKeys[0] ?? config.heroSMS.apiKey,
         proxyUrl: heroSmsProxyForWorker(config, 0),
         timeoutMs: HERO_SMS_COUNTRIES_TIMEOUT_MS,
     });
@@ -650,8 +644,9 @@ async function heroSmsCountriesStatus(config: AppConfig, refresh = false): Promi
 }
 
 async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: boolean} = {}): Promise<JsonValue> {
-    if (!config.heroSMS.apiKey) {
-        return {ok: false, error: "HeroSMS api_key 未配置"};
+    const apiKeys = config.heroSMS.apiKeys;
+    if (!apiKeys.length) {
+        return {ok: false, error: "HeroSMS api_keys/api_key 未配置"};
     }
 
     const key = heroSmsBalanceCacheKey(config);
@@ -665,26 +660,57 @@ async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: 
     }
 
     const promise: Promise<JsonValue> = (async (): Promise<JsonValue> => {
-        try {
-            const provider = createHeroSmsProvider({
-                apiKey: config.heroSMS.apiKey,
-                proxyUrl: heroSmsProxyForWorker(config, 0),
-                timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
-            });
-            const balance = await provider.getBalance();
+        const balances = await Promise.all(apiKeys.map(async (apiKey, index): Promise<JsonValue> => {
+            const label = redactHeroSmsApiKey(apiKey, index);
+            try {
+                const provider = createHeroSmsProvider({
+                    apiKey,
+                    proxyUrl: heroSmsProxyForWorker(config, index),
+                    timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
+                });
+                const balance = await provider.getBalance();
+                return {
+                    ok: true,
+                    index: index + 1,
+                    label,
+                    amount: balance.amount,
+                    raw: typeof balance.raw === "string" ? balance.raw : JSON.stringify(balance.raw),
+                    fetchedAt: new Date().toISOString(),
+                };
+            } catch (error) {
+                return {
+                    ok: false,
+                    index: index + 1,
+                    label,
+                    error: error instanceof Error ? error.message : String(error),
+                    fetchedAt: new Date().toISOString(),
+                };
+            }
+        }));
+
+        const successful = balances.filter((item): item is Record<string, JsonValue> =>
+            Boolean((item as Record<string, JsonValue>).ok) &&
+            typeof (item as Record<string, JsonValue>).amount === "number",
+        );
+        const total = successful.reduce((sum, item) => sum + Number(item.amount), 0);
+
+        if (successful.length > 0) {
             return {
                 ok: true,
-                amount: balance.amount,
-                raw: typeof balance.raw === "string" ? balance.raw : JSON.stringify(balance.raw),
-                fetchedAt: new Date().toISOString(),
-            };
-        } catch (error) {
-            return {
-                ok: false,
-                error: error instanceof Error ? error.message : String(error),
+                amount: total,
+                balances,
+                successCount: successful.length,
+                failureCount: balances.length - successful.length,
                 fetchedAt: new Date().toISOString(),
             };
         }
+
+        return {
+            ok: false,
+            balances,
+            error: "所有 HeroSMS key 余额查询失败",
+            fetchedAt: new Date().toISOString(),
+        };
     })();
 
     heroSmsBalanceInFlight = {key, promise};
@@ -906,17 +932,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const maxPrice = numberFromBody(body.maxPrice, hero.maxPrice);
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
         const values = {
-            api_key: typeof body.apiKey === "string" ? body.apiKey.trim() : hero.apiKey,
             proxy_strategy: proxyStrategyFromBody(body.proxyStrategy, hero.proxyStrategy),
-            proxy_urls: proxyUrlsFromBody(body.proxyUrls, hero.proxyUrls),
             countries: countriesFromBody(body.countries, hero.countries),
             acquire_priority: priorityFromBody(body.acquirePriority, hero.acquirePriority),
             min_price: Math.min(minPrice, maxPrice),
             max_price: Math.max(minPrice, maxPrice),
             price_step: priceStep,
-            poll_interval_ms: integerFromBody(body.pollIntervalMs, hero.pollIntervalMs),
             max_phone_tries: integerFromBody(body.maxPhoneTries, hero.maxPhoneTries),
-            auto_release_on_timeout: Boolean(body.autoReleaseOnTimeout),
         };
         const file = configPath();
         let content = "";
@@ -1028,6 +1050,7 @@ function html(): string {
     .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #heroSmsBalanceMeta { white-space: normal; overflow-wrap: anywhere; }
     .metric-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
     .metric-actions button { height: 24px; padding: 0 7px; font-size: 11px; }
     .icon-button { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-color: var(--line); background: #fff; color: var(--text); line-height: 1; }
@@ -1174,7 +1197,6 @@ function html(): string {
           <span id="smsConfigMsg" class="msg"></span>
         </div>
         <div class="form-grid">
-          <label class="wide"><span>HeroSMS API Key</span><input id="smsApiKey" autocomplete="off"></label>
           <label><span>接口代理策略</span><select id="smsProxyStrategy">
             <option value="hero_sms">专用代理</option>
             <option value="proxies">共用代理池</option>
@@ -1185,14 +1207,10 @@ function html(): string {
             <option value="price_low">低价优先</option>
             <option value="price_high">高价优先</option>
           </select></label>
-          <label class="proxy-field"><span>HeroSMS 专用代理</span><textarea id="smsProxyUrls" spellcheck="false" placeholder="每行一个代理 URL"></textarea></label>
           <label><span>最低价格</span><input id="smsMinPrice" type="number" min="0" step="0.0001"></label>
           <label><span>最高价格</span><input id="smsMaxPrice" type="number" min="0" step="0.0001"></label>
           <label><span>价格档位</span><input id="smsPriceStep" type="number" min="0" step="0.0001"></label>
           <label><span>最多换号</span><input id="smsMaxPhoneTries" type="number" min="1" step="1"></label>
-          <label><span>轮询间隔 ms</span><input id="smsPollIntervalMs" type="number" min="500" step="100"></label>
-          <label><span>最多轮询</span><span id="smsPollAttempts" class="readonly-field">自动计算</span></label>
-          <label><span>超时处理</span><span class="check-row"><input id="smsAutoRelease" type="checkbox">自动释放号码</span></label>
           <label class="country-field"><span>添加国家 <em id="smsCountrySource" class="muted"></em></span><span class="country-picker-row"><input id="smsCountrySearch" placeholder="搜索国家 / ID" autocomplete="off"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
         </div>
         <div id="smsCountryList" class="country-list"></div>
@@ -1433,21 +1451,44 @@ function html(): string {
       return amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
     }
 
-    function formatBalanceTime(value) {
-      const time = Date.parse(value || "");
-      if (!Number.isFinite(time)) return "";
-      return new Date(time).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+    function formatUtc8Timestamp(value) {
+      const parsed = value == null ? Date.now() : Date.parse(value || "");
+      if (!Number.isFinite(parsed)) return "";
+      const shifted = new Date(parsed + 8 * 60 * 60 * 1000);
+      const pad = (item) => String(item).padStart(2, "0");
+      return shifted.getUTCFullYear() + "-" +
+        pad(shifted.getUTCMonth() + 1) + "-" +
+        pad(shifted.getUTCDate()) + " " +
+        pad(shifted.getUTCHours()) + ":" +
+        pad(shifted.getUTCMinutes()) + ":" +
+        pad(shifted.getUTCSeconds()) + " UTC+8";
     }
 
     function updateHeroSmsBalance(balance) {
+      const meta = $("heroSmsBalanceMeta");
+      meta.title = "";
       if (!balance) {
         setText("heroSmsBalance", "-");
         setText("heroSmsBalanceMeta", "");
         return;
       }
+      if (Array.isArray(balance.balances)) {
+        const parts = balance.balances.map((item) => {
+          if (item && item.ok && item.amount != null) {
+            return String(item.label || ("Key #" + item.index)) + ": " + formatBalanceAmount(item.amount);
+          }
+          return String((item && item.label) || "Key") + ": 查询失败";
+        });
+        setText("heroSmsBalance", balance.ok && balance.amount != null ? "合计 " + formatBalanceAmount(balance.amount) : "查询失败");
+        const time = formatUtc8Timestamp(balance.fetchedAt);
+        const text = parts.join(" | ") + (time ? " · " + (balance.cached ? "缓存 " : "刚更新 ") + time : "");
+        setText("heroSmsBalanceMeta", text);
+        meta.title = text;
+        return;
+      }
       if (balance.ok && balance.amount != null) {
         setText("heroSmsBalance", formatBalanceAmount(balance.amount));
-        const time = formatBalanceTime(balance.fetchedAt);
+        const time = formatUtc8Timestamp(balance.fetchedAt);
         setText("heroSmsBalanceMeta", (balance.cached ? "缓存" : "刚更新") + (time ? " " + time : ""));
         return;
       }
@@ -1542,15 +1583,6 @@ function html(): string {
       $(id).value = value == null ? "" : String(value);
     }
 
-    function fixedSmsPollAttempts(intervalMs) {
-      const interval = Math.max(1, Math.floor(Number(intervalMs) || 5000));
-      return Math.max(1, Math.floor(120000 / interval) + 2);
-    }
-
-    function updateSmsPollAttemptsLabel(value) {
-      setText("smsPollAttempts", fixedSmsPollAttempts(value) + " 次");
-    }
-
     function normalizeSmsProxyStrategy(hero) {
       if (hero && (hero.proxyStrategy === "hero_sms" || hero.proxyStrategy === "proxies" || hero.proxyStrategy === "direct")) {
         return hero.proxyStrategy;
@@ -1558,25 +1590,13 @@ function html(): string {
       return hero && hero.useProxy === true ? "proxies" : "direct";
     }
 
-    function updateSmsProxyControls() {
-      const dedicated = $("smsProxyStrategy").value === "hero_sms";
-      $("smsProxyUrls").disabled = !dedicated;
-      $("smsProxyUrls").placeholder = dedicated ? "每行一个代理 URL" : "仅选择专用代理时使用";
-    }
-
     function fillSmsForm(hero) {
-      setInputValue("smsApiKey", hero.apiKey || "");
       $("smsProxyStrategy").value = normalizeSmsProxyStrategy(hero);
-      setInputValue("smsProxyUrls", Array.isArray(hero.proxyUrls) ? hero.proxyUrls.join("\\n") : "");
-      updateSmsProxyControls();
       $("smsAcquirePriority").value = hero.acquirePriority || "country";
       setInputValue("smsMinPrice", hero.minPrice);
       setInputValue("smsMaxPrice", hero.maxPrice);
       setInputValue("smsPriceStep", hero.priceStep);
       setInputValue("smsMaxPhoneTries", hero.maxPhoneTries);
-      setInputValue("smsPollIntervalMs", hero.pollIntervalMs);
-      updateSmsPollAttemptsLabel(hero.pollIntervalMs);
-      $("smsAutoRelease").checked = hero.autoReleaseOnTimeout !== false;
       state.selectedSmsCountries = Array.isArray(hero.countries) ? hero.countries.map(Number).filter(Boolean) : [];
       renderSelectedCountries();
     }
@@ -1597,17 +1617,13 @@ function html(): string {
 
     function smsPayloadFromForm() {
       return {
-        apiKey: $("smsApiKey").value.trim(),
         countries: state.selectedSmsCountries,
         acquirePriority: $("smsAcquirePriority").value,
         minPrice: Number($("smsMinPrice").value),
         maxPrice: Number($("smsMaxPrice").value),
         priceStep: Number($("smsPriceStep").value),
         maxPhoneTries: Number($("smsMaxPhoneTries").value),
-        pollIntervalMs: Number($("smsPollIntervalMs").value),
-        proxyStrategy: $("smsProxyStrategy").value,
-        proxyUrls: $("smsProxyUrls").value.split(/\\r?\\n|,/).map((item) => item.trim()).filter(Boolean),
-        autoReleaseOnTimeout: $("smsAutoRelease").checked
+        proxyStrategy: $("smsProxyStrategy").value
       };
     }
 
@@ -1783,13 +1799,13 @@ function html(): string {
         } catch {}
       });
       source.addEventListener("ready", () => {
-        appendLog({time: new Date().toISOString(), level: "info", message: "[admin] 实时日志已连接"});
+        appendLog({time: formatUtc8Timestamp(), level: "info", message: "[admin] 实时日志已连接"});
       });
       source.onerror = () => {
         const now = Date.now();
         if (now - state.lastLogStreamErrorAt > 10000) {
           state.lastLogStreamErrorAt = now;
-          appendLog({time: new Date().toISOString(), level: "warn", message: "[admin] 实时日志连接中断，浏览器会自动重连"});
+          appendLog({time: formatUtc8Timestamp(), level: "warn", message: "[admin] 实时日志连接中断，浏览器会自动重连"});
         }
       };
     }
@@ -1866,8 +1882,6 @@ function html(): string {
       (result) => "已标记失败 " + (result.failed || 0) + " 个，清理进行中 " + (result.cleared || 0) + " 个",
     );
 
-    $("smsPollIntervalMs").addEventListener("input", () => updateSmsPollAttemptsLabel($("smsPollIntervalMs").value));
-    $("smsProxyStrategy").addEventListener("change", updateSmsProxyControls);
     $("smsCountrySearch").addEventListener("input", renderCountryPicker);
     $("toggleLogsBtn").onclick = () => setLogsExpanded(!state.logsExpanded);
     $("refreshHeroSmsBalanceBtn").onclick = refreshHeroSmsBalance;

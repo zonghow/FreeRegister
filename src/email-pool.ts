@@ -1,6 +1,7 @@
 import {mkdir, open, readFile, rename, unlink, writeFile} from "node:fs/promises";
 import path from "node:path";
 import type {EmailPoolConfig} from "./config.js";
+import {formatUtc8Timestamp} from "./utils.js";
 
 const LOCK_RETRY_MS = 40;
 const LOCK_STALE_MS = 5 * 60 * 1000;
@@ -100,7 +101,7 @@ export class EmailPool {
             if (hasEmail(failedLines, lease.email)) {
                 return;
             }
-            const comment = `# failed at ${new Date().toISOString()} reason=${reason.replace(/\s+/g, " ").slice(0, 240)}`;
+            const comment = `# failed at ${formatUtc8Timestamp()} reason=${reason.replace(/\s+/g, " ").slice(0, 240)}`;
             await writeRawFileAtomic(this.paths.failed, ensureTrailingNewline([...failedLines, comment, currentLine].join("\n")));
         });
     }
@@ -242,7 +243,7 @@ export class EmailPool {
                 if (!email || hasEmail(nextFailedLines, email)) {
                     continue;
                 }
-                nextFailedLines.push(`# failed at ${new Date().toISOString()} reason=${normalizedReason}`, line);
+                nextFailedLines.push(`# failed at ${formatUtc8Timestamp()} reason=${normalizedReason}`, line);
                 failed += 1;
             }
 

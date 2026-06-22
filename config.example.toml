@@ -18,11 +18,17 @@ save_auth_json = false
 # HeroSMS 接码配置。
 # countries 按顺序尝试；网页国家选项会优先从 HeroSMS getCountries 接口获取并永久缓存。
 # acquire_priority 可选 country / price_low / price_high。
+# api_keys 非空时优先于旧字段 api_key；api_key_strategy 可选 round_robin / fill_first。
+# rps_limit 只限制 getNumberV2 取号请求，默认每个 key 40 RPS。
 # proxy_strategy 可选：
 #   "hero_sms" 使用 proxy_urls 专用代理池
 #   "proxies" 复用 [proxies].urls 代理池
 #   "direct" 不走代理
 [hero_sms]
+api_keys = []
+api_key_strategy = "round_robin"
+rps_limit = 40
+# 兼容旧单 key 配置；配置 api_keys 后会忽略 api_key。
 api_key = ""
 proxy_strategy = "direct"
 proxy_urls = []

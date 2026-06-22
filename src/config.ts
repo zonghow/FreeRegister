@@ -19,6 +19,9 @@ export interface OpenAIConfig {
 
 export interface HeroSMSConfig {
     apiKey: string;
+    apiKeys: string[];
+    apiKeyStrategy: HeroSMSApiKeyStrategy;
+    rpsLimit: number;
     proxyStrategy: HeroSMSProxyStrategy;
     proxyUrls: string[];
     useProxy: boolean;
@@ -66,6 +69,7 @@ export interface AppConfig {
     defaultPassword: string;
 }
 
+export type HeroSMSApiKeyStrategy = "round_robin" | "fill_first";
 export type HeroSMSProxyStrategy = "hero_sms" | "proxies" | "direct";
 type TomlValue = string | number | boolean | string[] | number[];
 type TomlObject = Record<string, Record<string, TomlValue>>;
@@ -86,6 +90,9 @@ const DEFAULT_CONFIG: AppConfig = {
     },
     heroSMS: {
         apiKey: "",
+        apiKeys: [],
+        apiKeyStrategy: "round_robin",
+        rpsLimit: 40,
         proxyStrategy: "direct",
         proxyUrls: [],
         useProxy: false,
@@ -269,6 +276,13 @@ function normalizeAcquirePriority(value: TomlValue | undefined, fallback: HeroSM
     return fallback;
 }
 
+function normalizeHeroSmsApiKeyStrategy(value: TomlValue | undefined, fallback: HeroSMSApiKeyStrategy): HeroSMSApiKeyStrategy {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (["round_robin", "round-robin", "roundrobin", "rr"].includes(normalized)) return "round_robin";
+    if (["fill_first", "fill-first", "fillfirst", "fill"].includes(normalized)) return "fill_first";
+    return fallback;
+}
+
 function normalizeHeroSmsProxyStrategy(
     value: TomlValue | undefined,
     legacyUseProxy: boolean,
@@ -335,6 +349,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         heroSMS: {
             ...config.heroSMS,
             apiKey: heroSMSApiKey || config.heroSMS.apiKey,
+            apiKeys: heroSMSApiKey ? [heroSMSApiKey] : config.heroSMS.apiKeys,
             maxPhoneTries: maxPhoneTries ?? config.heroSMS.maxPhoneTries,
         },
         openai: {
@@ -398,6 +413,9 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
     const maxPrice = positiveNumber(numberValue(hero.max_price, DEFAULT_CONFIG.heroSMS.maxPrice), DEFAULT_CONFIG.heroSMS.maxPrice);
     const legacyUseProxy = booleanValue(hero.use_proxy, DEFAULT_CONFIG.heroSMS.useProxy);
     const heroSmsProxyStrategy = normalizeHeroSmsProxyStrategy(hero.proxy_strategy, legacyUseProxy);
+    const legacyApiKey = stringValue(hero.api_key, DEFAULT_CONFIG.heroSMS.apiKey);
+    const configuredApiKeys = stringArrayValue(hero.api_keys);
+    const apiKeys = configuredApiKeys.length ? configuredApiKeys : (legacyApiKey ? [legacyApiKey] : []);
 
     const config: AppConfig = {
         run: {
@@ -411,7 +429,10 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         },
         openai: openAIConfig,
         heroSMS: {
-            apiKey: stringValue(hero.api_key, DEFAULT_CONFIG.heroSMS.apiKey),
+            apiKey: apiKeys[0] ?? legacyApiKey,
+            apiKeys,
+            apiKeyStrategy: normalizeHeroSmsApiKeyStrategy(hero.api_key_strategy, DEFAULT_CONFIG.heroSMS.apiKeyStrategy),
+            rpsLimit: positiveInteger(numberValue(hero.rps_limit, DEFAULT_CONFIG.heroSMS.rpsLimit), DEFAULT_CONFIG.heroSMS.rpsLimit),
             proxyStrategy: heroSmsProxyStrategy,
             proxyUrls: stringArrayValue(hero.proxy_urls),
             useProxy: heroSmsProxyStrategy !== "direct",

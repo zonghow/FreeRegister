@@ -37,7 +37,9 @@ cp config.example.toml config.toml
 
 ```toml
 [hero_sms]
-api_key = "your-hero-sms-api-key"
+api_keys = ["your-hero-sms-api-key"]
+api_key_strategy = "round_robin"
+rps_limit = 40
 proxy_strategy = "direct"
 proxy_urls = []
 
@@ -154,6 +156,10 @@ default_password = "change-this-password"
 save_auth_json = false
 
 [hero_sms]
+api_keys = []
+api_key_strategy = "round_robin"
+rps_limit = 40
+# 兼容旧单 key 配置；配置 api_keys 后会忽略 api_key。
 api_key = ""
 proxy_strategy = "direct"
 proxy_urls = []
@@ -185,6 +191,13 @@ urls = []
 - `country`：国家优先，每个国家按价格档位尝试。
 - `price_low`：低价优先，每个低价档位按国家顺序尝试。
 - `price_high`：高价优先，每个高价档位按国家顺序尝试。
+
+HeroSMS API Key 推荐使用 `api_keys` 数组配置；旧的单 key `api_key` 仍兼容。`api_key_strategy` 支持：
+
+- `round_robin`：取号时按 key 轮询，例如 A、B、A、B。
+- `fill_first`：先使用第一个 key，达到 `rps_limit` 后再使用下一个 key。
+
+`rps_limit` 只限制 `getNumberV2` 取号请求，默认每个 key `40 RPS`；查码、释放号码、余额和国家列表不参与这个限流。后台“接码配置”只保留常用项，API key、专用代理、轮询间隔和自动释放等高级字段可在网页的 `config.toml` 编辑器中修改。
 
 网页后台的国家选项会优先从 HeroSMS `getCountries` 接口获取，并永久缓存到 `.cache/hero-sms-countries.json`；接口失败时会继续使用旧缓存，没有缓存时才切换到内置兜底列表。点击“重新加载”会主动刷新这份缓存。
 

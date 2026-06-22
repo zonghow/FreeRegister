@@ -6,6 +6,7 @@ import {ImapFlow} from "imapflow";
 import {findLatestVerificationMail} from "./verification-matcher.js";
 import {appConfig} from "../config.js";
 import type {EmailLease, EmailPool} from "../email-pool.js";
+import {formatUtc8Timestamp} from "../utils.js";
 
 const HOTMAIL_TOKEN_DIR = path.resolve(process.cwd(), "hotmail");
 
@@ -694,10 +695,10 @@ async function getLatestVerificationMessage(targetEmail, account, minTimestampMs
 
     // Debug：打印最近 5 封邮件的 subject + from + recipient
     const debugLines = filtered.slice(0, 5).map((m) =>
-        `  [${m.folderId}] from=${m.from} to=${(m.toRecipients ?? []).join(',')} subject=${(m.subject ?? '').slice(0, 80)} bodyLen=${(m.bodyPreview ?? '').length} time=${new Date(m.receivedAtMs ?? 0).toISOString()}`
+        `  [${m.folderId}] from=${m.from} to=${(m.toRecipients ?? []).join(',')} subject=${(m.subject ?? '').slice(0, 80)} bodyLen=${(m.bodyPreview ?? '').length} time=${formatUtc8Timestamp(m.receivedAtMs ?? 0)}`
     );
     if (options.logDetails && debugLines.length) {
-        console.log(`hotmailMessagesDebug: targetEmail=${targetEmail} (after=${minTimestampMs ? new Date(minTimestampMs).toISOString() : 'any'})\n${debugLines.join("\n")}`);
+        console.log(`hotmailMessagesDebug: targetEmail=${targetEmail} (after=${minTimestampMs ? formatUtc8Timestamp(minTimestampMs) : 'any'})\n${debugLines.join("\n")}`);
     }
     if (options.logDetails && filtered[0]?.bodyPreview) {
         console.log(`hotmailFirstBodyPreview: ${filtered[0].bodyPreview.slice(0, 300).replace(/\s+/g, " ")}`);
