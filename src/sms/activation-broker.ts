@@ -1,6 +1,7 @@
 import type {
   SmsActivation,
   SmsProvider,
+  SmsWaitForCodeOptions,
   SmsVerificationCode,
 } from "./provider.js";
 
@@ -53,7 +54,7 @@ export interface ActivationLease extends SmsActivation {
   isNewActivation: boolean;
   requestedAnotherSms: boolean;
   round: number;
-  waitForVerificationCode(): Promise<SmsVerificationCode>;
+  waitForVerificationCode(options?: SmsWaitForCodeOptions): Promise<SmsVerificationCode>;
 }
 
 export interface ISMSActivationBroker {
@@ -371,10 +372,11 @@ export class ActivationBroker<
       isNewActivation,
       requestedAnotherSms,
       round: this.round,
-      waitForVerificationCode: async () => {
+      waitForVerificationCode: async (options?: SmsWaitForCodeOptions) => {
         try {
           const verification = await this.provider.waitForVerificationCode(
             activation.activationId,
+            options,
           );
           await this.markAsSucceed();
           return {
@@ -385,11 +387,42 @@ export class ActivationBroker<
             rawStatus: verification.rawStatus,
           };
         } catch (e) {
+          if ((e as {releaseActivation?: unknown})?.releaseActivation) {
+            this.finishAttemptAfterProviderRelease("failed");
+            throw e;
+          }
           await this.markAsFailed();
           throw e;
         }
       },
     };
+  }
+
+  private finishAttemptAfterProviderRelease(outcome: ActivationAttemptOutcome): void {
+    const activation = this.currentActivation;
+    if (!activation || !this.usage || !this.attemptActive) {
+      this.discardCurrentActivation();
+      return;
+    }
+
+    this.attemptActive = false;
+    this.usage.finishedAttemptCount += 1;
+    this.usage.lastOutcome = outcome;
+    this.usage.lastAttemptFinishedAt = new Date();
+    if (outcome === "success") {
+      this.usage.successCount += 1;
+      this.history.totalAttemptsSucceeded += 1;
+    } else {
+      this.usage.failureCount += 1;
+      this.history.totalAttemptsFailed += 1;
+    }
+    this.recordPhoneAttemptOutcome(activation.phoneNumber, activation.activationId, outcome);
+    this.history.totalWithdrawnActivations += 1;
+    this.recordPhoneRelease(activation.phoneNumber, "withdraw");
+    console.log(
+      `[pollSMSCode] provider 已释放 activation，丢弃本地状态 phone=+${activation.phoneNumber} outcome=${outcome}`,
+    );
+    this.reset();
   }
 
   private reset(): void {

@@ -8,6 +8,7 @@ import {createSMSBroker} from "./sms/index.js";
 export interface JobResult {
     ok: boolean;
     skipped?: boolean;
+    forced?: boolean;
 }
 
 export interface RegisterLogger {
@@ -16,7 +17,7 @@ export interface RegisterLogger {
     error(message: string): void;
 }
 
-export type RunnerStatus = "idle" | "running" | "pausing" | "paused" | "completed" | "failed";
+export type RunnerStatus = "idle" | "running" | "pausing" | "force_pausing" | "paused" | "force_paused" | "completed" | "failed";
 
 export interface RunnerSnapshot {
     status: RunnerStatus;
@@ -38,6 +39,24 @@ const DEFAULT_LOGGER: RegisterLogger = {
     warn: (message) => console.warn(message),
     error: (message) => console.error(message),
 };
+
+const FORCE_PAUSE_MESSAGE = "任务已被强制暂停";
+
+function createForcePauseError(): Error {
+    const error = new Error(FORCE_PAUSE_MESSAGE);
+    error.name = "ForcePauseError";
+    return error;
+}
+
+function isForcePauseError(error: unknown): boolean {
+    return error instanceof Error && (error.name === "ForcePauseError" || /aborted|abort|强制暂停/i.test(error.message));
+}
+
+function throwIfForcePaused(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw createForcePauseError();
+    }
+}
 
 function emptySnapshot(): RunnerSnapshot {
     return {
@@ -63,12 +82,13 @@ function createBroker(config: AppConfig) {
     }
     return createSMSBroker({
         apiKey: hero.apiKey,
-        pollAttempts: hero.pollAttempts,
         pollIntervalMs: hero.pollIntervalMs,
-        maxPrice: hero.maxPrice,
-        country: hero.country,
         countries: hero.countries,
-        priceTiers: hero.priceTiers,
+        acquirePriority: hero.acquirePriority,
+        minPrice: hero.minPrice,
+        maxPrice: hero.maxPrice,
+        priceStep: hero.priceStep,
+        autoReleaseOnTimeout: hero.autoReleaseOnTimeout,
     });
 }
 
@@ -82,13 +102,16 @@ async function phoneSignup(
     proxyUrl: string,
     workerId: number,
     logger: RegisterLogger,
+    signal?: AbortSignal,
 ): Promise<{phone: string}> {
     const smsBroker = createBroker(config);
     let lastErr: unknown = null;
 
-    for (let phoneTry = 1; phoneTry <= config.run.maxPhoneTries; phoneTry += 1) {
-        logger.info(`\n[worker-${workerId}] [phone] (${phoneTry}/${config.run.maxPhoneTries}) 取号...`);
+    for (let phoneTry = 1; phoneTry <= config.heroSMS.maxPhoneTries; phoneTry += 1) {
+        throwIfForcePaused(signal);
+        logger.info(`\n[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 取号...`);
         const lease = await smsBroker.getActivation();
+        throwIfForcePaused(signal);
         const phoneNumber = `+${lease.phoneNumber}`;
         logger.info(`[worker-${workerId}] [phone] 取到号码 ${phoneNumber}`);
 
@@ -102,20 +125,32 @@ async function phoneSignup(
             useBrowserSentinel: config.run.useBrowserSentinel,
             sentinelBrowserPath: config.sentinelBrowser.path,
             saveAuthJson: false,
+            abortSignal: signal,
         });
 
         try {
             await signupClient.authPhoneSignupHTTP(phoneNumber, async () => {
+                throwIfForcePaused(signal);
                 logger.info(`[worker-${workerId}] [phone] 等待 OTP...`);
-                const {code} = await lease.waitForVerificationCode();
+                const {code} = await lease.waitForVerificationCode({signal});
+                throwIfForcePaused(signal);
                 logger.info(`[worker-${workerId}] [phone] 收到 OTP: ${code}`);
                 return code;
             });
+            throwIfForcePaused(signal);
             logger.info(`[worker-${workerId}] [phone] 注册成功 ${phoneNumber}`);
             return {phone: phoneNumber};
         } catch (error) {
+            if (signal?.aborted) {
+                try {
+                    await smsBroker.markAsFailed(true);
+                } catch {
+                    // 忽略接码平台回收失败，继续结束任务。
+                }
+                throw createForcePauseError();
+            }
             lastErr = error;
-            logger.warn(`[worker-${workerId}] [phone] (${phoneTry}/${config.run.maxPhoneTries}) 失败: ${(error as Error).message}`);
+            logger.warn(`[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 失败: ${(error as Error).message}`);
             try {
                 await smsBroker.markAsFailed(true);
             } catch {
@@ -135,7 +170,9 @@ async function bindEmailViaOAuth(
     proxyUrl: string,
     workerId: number,
     logger: RegisterLogger,
+    signal?: AbortSignal,
 ): Promise<void> {
+    throwIfForcePaused(signal);
     const hotmailProvider = createHotmailProvider({lease, pool, proxyUrl});
     const bindEmail = await hotmailProvider.getEmailAddress();
     logger.info(`[worker-${workerId}] [oauth] 绑定邮箱候选: ${bindEmail}`);
@@ -147,18 +184,23 @@ async function bindEmailViaOAuth(
         manualMode: false,
         bindEmail,
         fetchAddEmailOtp: async () => {
+            throwIfForcePaused(signal);
             const startedAt = Date.now();
             logger.info(`[worker-${workerId}] [email] 等待 OTP for ${bindEmail} (after=${new Date(startedAt).toISOString()})`);
-            return await hotmailProvider.getEmailVerificationCode(bindEmail, {minTimestampMs: startedAt});
+            const code = await hotmailProvider.getEmailVerificationCode(bindEmail, {minTimestampMs: startedAt, signal});
+            throwIfForcePaused(signal);
+            return code;
         },
         proxyUrl,
         useBrowserSentinel: config.run.useBrowserSentinel,
         sentinelBrowserPath: config.sentinelBrowser.path,
         saveAuthJson: true,
         authJsonDir: config.cpaJson.dir,
+        abortSignal: signal,
     });
 
     const authResult = await oauthClient.authLoginHTTP();
+    throwIfForcePaused(signal);
     logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} cpa_json=${authResult.authFile || "not-saved"}`);
 }
 
@@ -168,7 +210,9 @@ export async function runOne(
     jobId: number,
     workerId: number,
     logger: RegisterLogger = DEFAULT_LOGGER,
+    signal?: AbortSignal,
 ): Promise<JobResult> {
+    throwIfForcePaused(signal);
     const proxyUrl = proxyForWorker(config, workerId - 1);
     const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(config.run.total);
     logger.info(`\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxy=${redactProxy(proxyUrl)} ==========`);
@@ -182,21 +226,33 @@ export async function runOne(
 
     let phone = "";
     try {
-        const signup = await phoneSignup(config, proxyUrl, workerId, logger);
+        const signup = await phoneSignup(config, proxyUrl, workerId, logger, signal);
         phone = signup.phone;
     } catch (error) {
+        if (signal?.aborted) {
+            logger.warn(`[worker-${workerId}] [force-pause] 手机阶段中止，邮箱放回池: ${emailLease.email}`);
+            await pool.returnToSource(emailLease);
+            return {ok: false, forced: true};
+        }
         logger.warn(`[worker-${workerId}] [phone] 注册失败，邮箱放回池: ${(error as Error).message}`);
         await pool.returnToSource(emailLease);
         return {ok: false};
     }
 
     try {
-        await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger);
+        await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal);
         await pool.markSuccess(emailLease);
         logger.info(`[worker-${workerId}] [success] phone=${phone} email=${emailLease.email}`);
         logger.info(`[POOL-RESULT] status=ok phone=${phone} email=${emailLease.email}`);
         return {ok: true};
     } catch (error) {
+        if (signal?.aborted) {
+            const reason = `force_paused: ${FORCE_PAUSE_MESSAGE}`;
+            logger.warn(`[worker-${workerId}] [force-pause] email=${emailLease.email} reason=${reason}`);
+            await pool.markFailed(emailLease, reason);
+            logger.info(`[POOL-RESULT] status=force-paused phone=${phone} email=${emailLease.email}`);
+            return {ok: false, forced: true};
+        }
         const message = error instanceof Error ? error.message : String(error);
         const reason = isEmailTouchedError(error) ? message : `oauth_uncertain: ${message}`;
         logger.warn(`[worker-${workerId}] [failed] email=${emailLease.email} reason=${reason}`);
@@ -209,12 +265,14 @@ export async function runOne(
 export class RegisterTaskRunner {
     private snapshot = emptySnapshot();
     private pauseRequested = false;
+    private forcePauseRequested = false;
+    private abortController: AbortController | null = null;
     private promise: Promise<RunnerSnapshot> | null = null;
 
     constructor(private readonly logger: RegisterLogger = DEFAULT_LOGGER) {}
 
     start(config: AppConfig): RunnerSnapshot {
-        if (this.snapshot.status === "running" || this.snapshot.status === "pausing") {
+        if (this.snapshot.status === "running" || this.snapshot.status === "pausing" || this.snapshot.status === "force_pausing") {
             throw new Error("任务正在运行");
         }
 
@@ -223,6 +281,8 @@ export class RegisterTaskRunner {
             ? config.run.concurrency
             : Math.min(config.run.concurrency, total);
         this.pauseRequested = false;
+        this.forcePauseRequested = false;
+        this.abortController = new AbortController();
         this.snapshot = {
             ...emptySnapshot(),
             status: "running",
@@ -256,6 +316,17 @@ export class RegisterTaskRunner {
         return this.getSnapshot();
     }
 
+    forcePause(): RunnerSnapshot {
+        if (this.snapshot.status === "running" || this.snapshot.status === "pausing") {
+            this.pauseRequested = true;
+            this.forcePauseRequested = true;
+            this.snapshot.status = "force_pausing";
+            this.logger.warn("[FreeRegister] 收到强制暂停请求：立即中止当前任务");
+            this.abortController?.abort();
+        }
+        return this.getSnapshot();
+    }
+
     async wait(): Promise<RunnerSnapshot> {
         return this.promise ?? this.getSnapshot();
     }
@@ -274,7 +345,7 @@ export class RegisterTaskRunner {
 
         const worker = async (workerId: number): Promise<void> => {
             for (;;) {
-                if (this.pauseRequested) {
+                if (this.pauseRequested || this.forcePauseRequested) {
                     return;
                 }
                 const jobId = this.snapshot.nextJob;
@@ -285,7 +356,10 @@ export class RegisterTaskRunner {
 
                 this.snapshot.activeWorkers += 1;
                 try {
-                    const result = await runOne(config, pool, jobId, workerId, this.logger);
+                    const result = await runOne(config, pool, jobId, workerId, this.logger, this.abortController?.signal);
+                    if (result.forced) {
+                        return;
+                    }
                     if (result.ok) {
                         this.snapshot.okCount += 1;
                     } else if (result.skipped) {
@@ -303,16 +377,20 @@ export class RegisterTaskRunner {
         };
 
         await Promise.all(Array.from({length: this.snapshot.concurrency}, (_, index) => worker(index + 1).catch(async (error) => {
+            if (this.forcePauseRequested && isForcePauseError(error)) {
+                return;
+            }
             this.snapshot.failedCount += 1;
             this.logger.error(`[worker-${index + 1}] 未处理错误: ${error instanceof Error ? error.stack || error.message : String(error)}`);
             await noop();
         })));
 
-        this.snapshot.status = this.pauseRequested ? "paused" : "completed";
+        this.snapshot.status = this.forcePauseRequested ? "force_paused" : (this.pauseRequested ? "paused" : "completed");
         if (config.run.runUntilEmpty && this.snapshot.status === "completed") {
             this.logger.info("[FreeRegister] 邮箱池已空，持续运行任务结束");
         }
-        this.logger.info(`\n[FreeRegister] ${this.snapshot.status === "paused" ? "已暂停" : "完成"} ok=${this.snapshot.okCount} failed=${this.snapshot.failedCount} skipped=${this.snapshot.skippedCount}`);
+        const statusText = this.snapshot.status === "force_paused" ? "已强制暂停" : (this.snapshot.status === "paused" ? "已暂停" : "完成");
+        this.logger.info(`\n[FreeRegister] ${statusText} ok=${this.snapshot.okCount} failed=${this.snapshot.failedCount} skipped=${this.snapshot.skippedCount}`);
         return this.getSnapshot();
     }
 }

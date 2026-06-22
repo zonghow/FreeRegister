@@ -12,5 +12,6 @@ email.failed.txt
 auth/
 hotmail/
 cpa_json/
+.cache/
 *.bak
 *.tmp

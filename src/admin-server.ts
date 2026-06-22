@@ -4,9 +4,9 @@ import {mkdir, readFile, readdir, rename, stat, writeFile} from "node:fs/promise
 import path from "node:path";
 import JSZip from "jszip";
 import {EmailPool, emailFromLine} from "./email-pool.js";
-import {loadConfig, parseToml, proxyForWorker, redactProxy, type AppConfig} from "./config.js";
+import {loadConfig, parseToml, proxyForWorker, redactProxy, type AppConfig, type HeroSMSConfig} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
-import {createHeroSmsProvider} from "./sms/heroSMS.js";
+import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | {[key: string]: JsonValue};
 type LogLevel = "info" | "warn" | "error";
@@ -18,6 +18,19 @@ interface LogEntry {
     message: string;
 }
 
+interface HeroSmsCountryOption {
+    id: number;
+    label: string;
+}
+
+interface HeroSmsCountriesStatus {
+    source: "api" | "fallback";
+    countries: HeroSmsCountryOption[];
+    fetchedAt: string;
+    error?: string;
+    cached?: boolean;
+}
+
 const DEFAULT_PORT = 8788;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_LOG_LINES = 2000;
@@ -26,6 +39,9 @@ const SESSION_COOKIE = "fr_session";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const HERO_SMS_BALANCE_TTL_MS = 30 * 1000;
 const HERO_SMS_BALANCE_TIMEOUT_MS = 5000;
+const HERO_SMS_COUNTRIES_TIMEOUT_MS = 10000;
+const HERO_SMS_COUNTRIES_CACHE_VERSION = 1;
+const HERO_SMS_COUNTRIES_CACHE_FILE = path.join(".cache", "hero-sms-countries.json");
 const VENDOR_ASSETS: Record<string, {file: string; contentType: string}> = {
     "/vendor/codemirror/codemirror.css": {
         file: "node_modules/codemirror/lib/codemirror.css",
@@ -40,6 +56,23 @@ const VENDOR_ASSETS: Record<string, {file: string; contentType: string}> = {
         contentType: "application/javascript; charset=utf-8",
     },
 };
+const HERO_SMS_FALLBACK_COUNTRIES = [
+    {id: 4, label: "菲律宾 (Philippines)"},
+    {id: 6, label: "印度尼西亚 (Indonesia)"},
+    {id: 8, label: "肯尼亚 (Kenya)"},
+    {id: 10, label: "越南 (Vietnam)"},
+    {id: 15, label: "波兰 (Poland)"},
+    {id: 16, label: "英国 (United Kingdom)"},
+    {id: 32, label: "罗马尼亚 (Romania)"},
+    {id: 33, label: "哥伦比亚 (Colombia)"},
+    {id: 43, label: "德国 (Germany)"},
+    {id: 52, label: "泰国 (Thailand)"},
+    {id: 73, label: "巴西 (Brazil)"},
+    {id: 78, label: "法国 (France)"},
+    {id: 151, label: "智利 (Chile)"},
+    {id: 182, label: "日本 (Japan)"},
+    {id: 187, label: "美国（物理) (USA)"},
+];
 
 class LogBuffer implements RegisterLogger {
     private readonly lines: LogEntry[] = [];
@@ -116,6 +149,8 @@ const runner = new RegisterTaskRunner(logger);
 const sessions = new Map<string, number>();
 let heroSmsBalanceCache: {key: string; expiresAt: number; value: JsonValue} | null = null;
 let heroSmsBalanceInFlight: {key: string; promise: Promise<JsonValue>} | null = null;
+let heroSmsCountriesCache: HeroSmsCountriesStatus | null = null;
+let heroSmsCountriesInFlight: Promise<HeroSmsCountriesStatus> | null = null;
 const originalConsole = {
     log: console.log.bind(console),
     warn: console.warn.bind(console),
@@ -290,6 +325,90 @@ async function writeFileAtomic(filePath: string, content: string): Promise<void>
     await rename(tmpPath, filePath);
 }
 
+function formatTomlValue(value: string | number | boolean | number[]): string {
+    if (Array.isArray(value)) return `[${value.join(", ")}]`;
+    if (typeof value === "string") return JSON.stringify(value);
+    if (typeof value === "boolean") return value ? "true" : "false";
+    return String(value);
+}
+
+function upsertTomlSection(raw: string, section: string, values: Record<string, string | number | boolean | number[]>, removeKeys: string[] = []): string {
+    const lines = raw.split(/\r?\n/);
+    const sectionHeader = `[${section}]`;
+    const sectionStart = lines.findIndex((line) => line.trim() === sectionHeader);
+    const keys = new Set([...Object.keys(values), ...removeKeys]);
+
+    if (sectionStart < 0) {
+        const body = Object.entries(values).map(([key, value]) => `${key} = ${formatTomlValue(value)}`);
+        return `${raw.trimEnd()}\n\n${sectionHeader}\n${body.join("\n")}\n`;
+    }
+
+    let sectionEnd = lines.length;
+    for (let index = sectionStart + 1; index < lines.length; index += 1) {
+        if (/^\s*\[[^\]]+]\s*$/.test(lines[index])) {
+            sectionEnd = index;
+            break;
+        }
+    }
+
+    const nextSectionLines = lines.slice(sectionStart, sectionEnd).filter((line, index) => {
+        if (index === 0) return true;
+        const match = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=/);
+        if (!match) return true;
+        const key = match[1];
+        if (!keys.has(key)) return true;
+        return false;
+    });
+
+    for (const [key, value] of Object.entries(values)) {
+        nextSectionLines.push(`${key} = ${formatTomlValue(value)}`);
+    }
+
+    const nextLines = [
+        ...lines.slice(0, sectionStart),
+        ...nextSectionLines,
+        ...lines.slice(sectionEnd),
+    ];
+    return `${nextLines.join("\n").trimEnd()}\n`;
+}
+
+function smsConfigJson(config: AppConfig): JsonValue {
+    return {
+        ...config.heroSMS,
+        countries: config.heroSMS.countries,
+        pollAttempts: fixedHeroSmsPollAttempts(config.heroSMS.pollIntervalMs),
+    } as unknown as JsonValue;
+}
+
+function numberFromBody(value: unknown, fallback: number): number {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function integerFromBody(value: unknown, fallback: number): number {
+    const parsed = Math.floor(Number(value));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function countriesFromBody(value: unknown, fallback: number[]): number[] {
+    const source = Array.isArray(value) ? value : [];
+    const seen = new Set<number>();
+    const countries: number[] = [];
+    for (const item of source) {
+        const id = Math.floor(Number(item));
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        countries.push(id);
+    }
+    return countries.length ? countries : fallback;
+}
+
+function priorityFromBody(value: unknown, fallback: HeroSMSConfig["acquirePriority"]): HeroSMSConfig["acquirePriority"] {
+    const normalized = String(value ?? "").trim();
+    if (normalized === "country" || normalized === "price_low" || normalized === "price_high") return normalized;
+    return fallback;
+}
+
 function publicConfigSummary(config: AppConfig): JsonValue {
     return {
         run: config.run as unknown as JsonValue,
@@ -306,6 +425,154 @@ function heroSmsBalanceCacheKey(config: AppConfig): string {
         .update("\0")
         .update(proxyForWorker(config, 0))
         .digest("hex");
+}
+
+function countryOptionsFromProvider(countries: HeroSmsCountry[]): HeroSmsCountryOption[] {
+    const seen = new Set<number>();
+    const options: HeroSmsCountryOption[] = [];
+    for (const country of countries) {
+        const id = Math.floor(Number(country.id));
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        const label = String(country.label || "").trim() || `Country #${id}`;
+        options.push({
+            id,
+            label,
+        });
+    }
+    return options;
+}
+
+function countryOptionsFromUnknown(value: unknown): HeroSmsCountryOption[] {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<number>();
+    const options: HeroSmsCountryOption[] = [];
+    for (const item of value) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        const id = Math.floor(Number(record.id));
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        const label = String(record.label || "").trim() || `Country #${id}`;
+        options.push({id, label});
+    }
+    return options;
+}
+
+function mergeSelectedCountries(countries: HeroSmsCountryOption[], selectedIds: number[]): HeroSmsCountryOption[] {
+    const next = [...countries];
+    const seen = new Set(next.map((country) => country.id));
+    for (const item of selectedIds) {
+        const id = Math.floor(Number(item));
+        if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        next.push({id, label: `Country #${id}`});
+    }
+    return next;
+}
+
+function fallbackHeroSmsCountries(error?: unknown): HeroSmsCountriesStatus {
+    return {
+        source: "fallback",
+        countries: HERO_SMS_FALLBACK_COUNTRIES,
+        fetchedAt: new Date().toISOString(),
+        ...(error ? {error: error instanceof Error ? error.message : String(error)} : {}),
+    };
+}
+
+function heroSmsCountriesCachePath(): string {
+    return path.resolve(process.cwd(), HERO_SMS_COUNTRIES_CACHE_FILE);
+}
+
+async function readHeroSmsCountriesCache(): Promise<HeroSmsCountriesStatus | null> {
+    try {
+        const parsed = JSON.parse(await readFile(heroSmsCountriesCachePath(), "utf8")) as Record<string, unknown>;
+        if (Number(parsed.version) !== HERO_SMS_COUNTRIES_CACHE_VERSION) return null;
+        const countries = countryOptionsFromUnknown(parsed.countries);
+        if (!countries.length) return null;
+        const fetchedAt = String(parsed.fetchedAt || "").trim() || new Date().toISOString();
+        return {source: "api", countries, fetchedAt, cached: true};
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        console.warn(`[admin] HeroSMS 国家缓存读取失败: ${(error as Error).message}`);
+        return null;
+    }
+}
+
+async function writeHeroSmsCountriesCache(status: HeroSmsCountriesStatus): Promise<void> {
+    if (status.source !== "api" || !status.countries.length) return;
+    const file = heroSmsCountriesCachePath();
+    await mkdir(path.dirname(file), {recursive: true});
+    await writeFileAtomic(file, `${JSON.stringify({
+        version: HERO_SMS_COUNTRIES_CACHE_VERSION,
+        fetchedAt: status.fetchedAt,
+        countries: status.countries,
+    }, null, 2)}\n`);
+}
+
+async function fetchHeroSmsCountries(config: AppConfig): Promise<HeroSmsCountriesStatus> {
+    const provider = createHeroSmsProvider({
+        apiKey: config.heroSMS.apiKey,
+        proxyUrl: proxyForWorker(config, 0),
+        timeoutMs: HERO_SMS_COUNTRIES_TIMEOUT_MS,
+    });
+    const countries = countryOptionsFromProvider(await provider.getCountries());
+    if (!countries.length) {
+        throw new Error("HeroSMS getCountries 返回国家列表为空");
+    }
+    const status: HeroSmsCountriesStatus = {
+        source: "api",
+        countries,
+        fetchedAt: new Date().toISOString(),
+    };
+    await writeHeroSmsCountriesCache(status);
+    return status;
+}
+
+async function heroSmsCountriesStatus(config: AppConfig, refresh = false): Promise<HeroSmsCountriesStatus> {
+    if (!refresh && heroSmsCountriesCache) {
+        return {...heroSmsCountriesCache, cached: true};
+    }
+
+    if (!refresh) {
+        const cached = await readHeroSmsCountriesCache();
+        if (cached) {
+            heroSmsCountriesCache = cached;
+            return cached;
+        }
+    }
+
+    if (heroSmsCountriesInFlight) {
+        return heroSmsCountriesInFlight;
+    }
+
+    const promise = (async (): Promise<HeroSmsCountriesStatus> => {
+        try {
+            const fresh = await fetchHeroSmsCountries(config);
+            heroSmsCountriesCache = fresh;
+            return fresh;
+        } catch (error) {
+            const cached = heroSmsCountriesCache ?? await readHeroSmsCountriesCache();
+            if (cached) {
+                heroSmsCountriesCache = cached;
+                return {
+                    ...cached,
+                    cached: true,
+                    error: error instanceof Error ? error.message : String(error),
+                };
+            }
+            return fallbackHeroSmsCountries(error);
+        }
+    })();
+
+    heroSmsCountriesInFlight = promise;
+    try {
+        return await promise;
+    } finally {
+        if (heroSmsCountriesInFlight === promise) {
+            heroSmsCountriesInFlight = null;
+        }
+    }
 }
 
 async function heroSmsBalanceStatus(config: AppConfig): Promise<JsonValue> {
@@ -532,8 +799,61 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const content = typeof body.content === "string" ? body.content : "";
         parseToml(content);
         await writeFileAtomic(configPath(), content.endsWith("\n") ? content : `${content}\n`);
+        heroSmsBalanceCache = null;
         logger.info("[admin] config.toml 已保存，下次启动任务会读取最新配置");
         sendJson(res, 200, {ok: true});
+        return;
+    }
+
+    if (pathname === "/api/sms-config" && req.method === "GET") {
+        const config = loadConfig();
+        const url = new URL(req.url ?? "/", "http://localhost");
+        const refreshCountries = url.searchParams.get("refreshCountries") === "1";
+        if (refreshCountries) heroSmsCountriesCache = null;
+        const countryStatus = await heroSmsCountriesStatus(config, refreshCountries);
+        sendJson(res, 200, {
+            ok: true,
+            heroSMS: smsConfigJson(config),
+            countries: mergeSelectedCountries(countryStatus.countries, config.heroSMS.countries) as unknown as JsonValue,
+            countriesSource: countryStatus.source,
+            countriesError: countryStatus.error ?? "",
+            countriesFetchedAt: countryStatus.fetchedAt,
+            countriesCached: countryStatus.cached ?? false,
+        });
+        return;
+    }
+
+    if (pathname === "/api/sms-config" && req.method === "PUT") {
+        const body = await readJson<Record<string, unknown>>(req);
+        const config = loadConfig();
+        const hero = config.heroSMS;
+        const minPrice = numberFromBody(body.minPrice, hero.minPrice);
+        const maxPrice = numberFromBody(body.maxPrice, hero.maxPrice);
+        const priceStep = numberFromBody(body.priceStep, hero.priceStep);
+        const values = {
+            api_key: typeof body.apiKey === "string" ? body.apiKey.trim() : hero.apiKey,
+            countries: countriesFromBody(body.countries, hero.countries),
+            acquire_priority: priorityFromBody(body.acquirePriority, hero.acquirePriority),
+            min_price: Math.min(minPrice, maxPrice),
+            max_price: Math.max(minPrice, maxPrice),
+            price_step: priceStep,
+            poll_interval_ms: integerFromBody(body.pollIntervalMs, hero.pollIntervalMs),
+            max_phone_tries: integerFromBody(body.maxPhoneTries, hero.maxPhoneTries),
+            auto_release_on_timeout: Boolean(body.autoReleaseOnTimeout),
+        };
+        const file = configPath();
+        let content = "";
+        try {
+            content = await readFile(file, "utf8");
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const nextContent = upsertTomlSection(content, "hero_sms", values, ["country", "price_tiers", "poll_attempts"]);
+        parseToml(nextContent);
+        await writeFileAtomic(file, nextContent);
+        heroSmsBalanceCache = null;
+        logger.info("[admin] 接码配置已保存，下次启动任务会读取最新配置");
+        sendJson(res, 200, {ok: true, heroSMS: smsConfigJson(loadConfig())});
         return;
     }
 
@@ -575,6 +895,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         return;
     }
 
+    if (pathname === "/api/task/force-pause" && req.method === "POST") {
+        const snapshot = runner.forcePause();
+        sendJson(res, 200, {ok: true, runner: snapshot as unknown as JsonValue});
+        return;
+    }
+
     sendError(res, 404, "接口不存在");
 }
 
@@ -610,6 +936,18 @@ function html(): string {
     button.danger { background: var(--danger); border-color: var(--danger); }
     button:disabled { opacity: .45; cursor: not-allowed; }
     input { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; min-width: 120px; }
+    select { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; min-width: 120px; }
+    label { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
+    label span { color: var(--muted); }
+    label input, label select { color: var(--text); font-size: 13px; }
+    .form-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; align-items: end; }
+    .form-grid .wide { grid-column: span 2; }
+    .readonly-field { display: flex; align-items: center; min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); color: var(--text); font-size: 13px; }
+    .check-row { height: 30px; display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
+    .check-row input { min-width: 0; width: 15px; height: 15px; }
+    .country-list { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; }
+    .country-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; background: #fafafa; }
+    .country-pill button { width: 22px; height: 22px; padding: 0; border-color: var(--line); background: #fff; color: var(--text); }
     textarea { width: 100%; min-height: 160px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.42; }
     #configText { min-height: 330px; }
     .CodeMirror { height: 340px; border: 1px solid var(--line); border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.42; }
@@ -632,6 +970,7 @@ function html(): string {
     .muted { color: var(--muted); }
     .status { padding: 3px 8px; border-radius: 999px; background: #ececea; color: #333; font-size: 12px; }
     .msg { min-height: 18px; color: var(--muted); }
+    @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide { grid-column: span 2; } }
     @media (max-width: 760px) { header { padding: 0 12px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   </style>
 </head>
@@ -669,6 +1008,7 @@ function html(): string {
           <div class="toolbar">
             <button id="startBtn">开始</button>
             <button id="pauseBtn" class="secondary">暂停</button>
+            <button id="forcePauseBtn" class="danger">强制暂停</button>
             <button id="openImportModalBtn" class="secondary">导入邮箱</button>
             <button id="exportBtn" class="secondary">导出成功邮箱与 CPA JSON</button>
           </div>
@@ -676,6 +1016,31 @@ function html(): string {
             <span id="taskMsg" class="msg"></span>
             <span id="importMsg" class="msg"></span>
           </div>
+        </div>
+        <div class="panel-head">
+          <h2>接码配置</h2>
+          <span id="smsConfigMsg" class="msg"></span>
+        </div>
+        <div class="form-grid">
+          <label class="wide"><span>HeroSMS API Key</span><input id="smsApiKey" autocomplete="off"></label>
+          <label><span>取号策略</span><select id="smsAcquirePriority">
+            <option value="country">国家优先</option>
+            <option value="price_low">低价优先</option>
+            <option value="price_high">高价优先</option>
+          </select></label>
+          <label><span>最低价格</span><input id="smsMinPrice" type="number" min="0" step="0.0001"></label>
+          <label><span>最高价格</span><input id="smsMaxPrice" type="number" min="0" step="0.0001"></label>
+          <label><span>价格档位</span><input id="smsPriceStep" type="number" min="0" step="0.0001"></label>
+          <label><span>最多换号</span><input id="smsMaxPhoneTries" type="number" min="1" step="1"></label>
+          <label><span>轮询间隔 ms</span><input id="smsPollIntervalMs" type="number" min="500" step="100"></label>
+          <label><span>最多轮询</span><span id="smsPollAttempts" class="readonly-field">自动计算</span></label>
+          <label><span>超时处理</span><span class="check-row"><input id="smsAutoRelease" type="checkbox">自动释放号码</span></label>
+          <label class="wide"><span>添加国家 <em id="smsCountrySource" class="muted"></em></span><span class="row"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
+        </div>
+        <div id="smsCountryList" class="country-list"></div>
+        <div class="row">
+          <button id="saveSmsConfigBtn">保存接码配置</button>
+          <button id="reloadSmsConfigBtn" class="secondary">重新加载</button>
         </div>
       </section>
 
@@ -728,7 +1093,9 @@ function html(): string {
       logFlushTimer: 0,
       lastLogStreamErrorAt: 0,
       maxVisibleLogs: 600,
-      configEditor: null
+      configEditor: null,
+      smsCountries: [],
+      selectedSmsCountries: []
     };
 
     async function api(path, options = {}) {
@@ -824,6 +1191,129 @@ function html(): string {
       }
       setText("heroSmsBalance", "查询失败");
       setText("heroSmsBalanceMeta", String(balance.error || "").slice(0, 64));
+    }
+
+    function countryLabel(id) {
+      const matched = state.smsCountries.find((item) => Number(item.id) === Number(id));
+      return matched ? matched.label + " #" + matched.id : "Country #" + id;
+    }
+
+    function renderCountryPicker() {
+      const picker = $("smsCountryPicker");
+      picker.innerHTML = "";
+      for (const country of state.smsCountries) {
+        if (state.selectedSmsCountries.includes(Number(country.id))) continue;
+        const option = document.createElement("option");
+        option.value = String(country.id);
+        option.textContent = country.label + " #" + country.id;
+        picker.appendChild(option);
+      }
+    }
+
+    function renderSelectedCountries() {
+      const box = $("smsCountryList");
+      box.innerHTML = "";
+      state.selectedSmsCountries.forEach((id, index) => {
+        const pill = document.createElement("span");
+        pill.className = "country-pill";
+        const text = document.createElement("span");
+        text.textContent = countryLabel(id);
+        pill.appendChild(text);
+        const up = document.createElement("button");
+        up.type = "button";
+        up.textContent = "U";
+        up.title = "上移";
+        up.setAttribute("aria-label", "上移");
+        up.disabled = index === 0;
+        up.onclick = () => {
+          const next = [...state.selectedSmsCountries];
+          [next[index - 1], next[index]] = [next[index], next[index - 1]];
+          state.selectedSmsCountries = next;
+          renderSelectedCountries();
+        };
+        const down = document.createElement("button");
+        down.type = "button";
+        down.textContent = "D";
+        down.title = "下移";
+        down.setAttribute("aria-label", "下移");
+        down.disabled = index === state.selectedSmsCountries.length - 1;
+        down.onclick = () => {
+          const next = [...state.selectedSmsCountries];
+          [next[index], next[index + 1]] = [next[index + 1], next[index]];
+          state.selectedSmsCountries = next;
+          renderSelectedCountries();
+        };
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "X";
+        remove.title = "删除";
+        remove.setAttribute("aria-label", "删除");
+        remove.onclick = () => {
+          state.selectedSmsCountries = state.selectedSmsCountries.filter((item) => item !== id);
+          renderCountryPicker();
+          renderSelectedCountries();
+        };
+        pill.appendChild(up);
+        pill.appendChild(down);
+        pill.appendChild(remove);
+        box.appendChild(pill);
+      });
+      renderCountryPicker();
+    }
+
+    function setInputValue(id, value) {
+      $(id).value = value == null ? "" : String(value);
+    }
+
+    function fixedSmsPollAttempts(intervalMs) {
+      const interval = Math.max(1, Math.floor(Number(intervalMs) || 5000));
+      return Math.max(1, Math.floor(120000 / interval) + 2);
+    }
+
+    function updateSmsPollAttemptsLabel(value) {
+      setText("smsPollAttempts", fixedSmsPollAttempts(value) + " 次");
+    }
+
+    function fillSmsForm(hero) {
+      setInputValue("smsApiKey", hero.apiKey || "");
+      $("smsAcquirePriority").value = hero.acquirePriority || "country";
+      setInputValue("smsMinPrice", hero.minPrice);
+      setInputValue("smsMaxPrice", hero.maxPrice);
+      setInputValue("smsPriceStep", hero.priceStep);
+      setInputValue("smsMaxPhoneTries", hero.maxPhoneTries);
+      setInputValue("smsPollIntervalMs", hero.pollIntervalMs);
+      updateSmsPollAttemptsLabel(hero.pollIntervalMs);
+      $("smsAutoRelease").checked = hero.autoReleaseOnTimeout !== false;
+      state.selectedSmsCountries = Array.isArray(hero.countries) ? hero.countries.map(Number).filter(Boolean) : [];
+      renderSelectedCountries();
+    }
+
+    async function loadSmsConfig(refreshCountries = false) {
+      const data = await apiJson("/api/sms-config" + (refreshCountries ? "?refreshCountries=1" : ""));
+      state.smsCountries = data.countries || [];
+      const source = data.countriesSource === "api" ? "HeroSMS 接口" : "内置兜底";
+      const cached = data.countriesCached ? " / 永久缓存" : "";
+      setText("smsCountrySource", "国家列表：" + source + cached);
+      if (data.countriesError) {
+        const prefix = data.countriesSource === "fallback" ? "国家列表接口失败，已用内置列表：" : "国家列表刷新失败，继续使用永久缓存：";
+        setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
+      }
+      renderCountryPicker();
+      fillSmsForm(data.heroSMS || {});
+    }
+
+    function smsPayloadFromForm() {
+      return {
+        apiKey: $("smsApiKey").value.trim(),
+        countries: state.selectedSmsCountries,
+        acquirePriority: $("smsAcquirePriority").value,
+        minPrice: Number($("smsMinPrice").value),
+        maxPrice: Number($("smsMaxPrice").value),
+        priceStep: Number($("smsPriceStep").value),
+        maxPhoneTries: Number($("smsMaxPhoneTries").value),
+        pollIntervalMs: Number($("smsPollIntervalMs").value),
+        autoReleaseOnTimeout: $("smsAutoRelease").checked
+      };
     }
 
     function openImportModal() {
@@ -934,7 +1424,7 @@ function html(): string {
         state.authed = true;
         showApp();
         connectLogStream();
-        await Promise.all([refreshStatus(), loadConfig()]);
+        await Promise.all([refreshStatus(), loadConfig(), loadSmsConfig()]);
       } catch (error) {
         setText("loginMsg", error.message);
       }
@@ -971,8 +1461,42 @@ function html(): string {
       }
     };
 
+    $("forcePauseBtn").onclick = async () => {
+      try {
+        await apiJson("/api/task/force-pause", {method: "POST", body: "{}"});
+        setText("taskMsg", "强制暂停请求已发送");
+        await refreshStatus();
+      } catch (error) {
+        setText("taskMsg", error.message);
+      }
+    };
+
+    $("smsPollIntervalMs").addEventListener("input", () => updateSmsPollAttemptsLabel($("smsPollIntervalMs").value));
     $("openImportModalBtn").onclick = openImportModal;
     $("closeImportModalBtn").onclick = closeImportModal;
+    $("smsAddCountryBtn").onclick = () => {
+      const id = Number($("smsCountryPicker").value);
+      if (!Number.isFinite(id) || id <= 0 || state.selectedSmsCountries.includes(id)) return;
+      state.selectedSmsCountries = [...state.selectedSmsCountries, id];
+      renderSelectedCountries();
+    };
+    $("reloadSmsConfigBtn").onclick = async () => {
+      try {
+        await loadSmsConfig(true);
+        setText("smsConfigMsg", "已重新加载");
+      } catch (error) {
+        setText("smsConfigMsg", error.message);
+      }
+    };
+    $("saveSmsConfigBtn").onclick = async () => {
+      try {
+        await apiJson("/api/sms-config", {method: "PUT", body: JSON.stringify(smsPayloadFromForm())});
+        await Promise.all([refreshStatus(), loadConfig(), loadSmsConfig()]);
+        setText("smsConfigMsg", "已保存");
+      } catch (error) {
+        setText("smsConfigMsg", error.message);
+      }
+    };
     $("importModal").addEventListener("click", (event) => {
       if (event.target === $("importModal")) closeImportModal();
     });
@@ -1021,7 +1545,7 @@ function html(): string {
       try {
         await apiJson("/api/config", {method: "PUT", body: JSON.stringify({content: getConfigContent()})});
         setText("configMsg", "已保存");
-        await refreshStatus();
+        await Promise.all([refreshStatus(), loadSmsConfig()]);
       } catch (error) {
         setText("configMsg", error.message);
       }
@@ -1030,6 +1554,7 @@ function html(): string {
     $("reloadConfigBtn").onclick = async () => {
       try {
         await loadConfig();
+        await loadSmsConfig();
         setText("configMsg", "已重新加载");
       } catch (error) {
         setText("configMsg", error.message);
@@ -1039,7 +1564,7 @@ function html(): string {
     refreshStatus().then(() => {
       if (state.authed) {
         connectLogStream();
-        Promise.all([loadConfig()]);
+        Promise.all([loadConfig(), loadSmsConfig()]);
       }
     });
     setInterval(refreshStatus, 2500);

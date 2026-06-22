@@ -69,6 +69,126 @@ const HOTMAIL_IMAP_FOLDERS = ["INBOX", "Junk"];
 const aliasAccountMap = new Map();
 let accountCache = null;
 
+function toError(value) {
+    return value instanceof Error ? value : new Error(String(value ?? "unknown error"));
+}
+
+export function protectImapClient(client, label = "imap") {
+    let lastError = null;
+    let closed = false;
+    const waiters = new Set();
+
+    client.on("error", (err) => {
+        const error = toError(err);
+        lastError = error;
+        if (!closed) {
+            console.warn(`Hotmail IMAP error (${label}): ${error.message}`);
+        }
+        for (const reject of Array.from(waiters)) {
+            reject(error);
+        }
+        waiters.clear();
+    });
+
+    function makeErrorWaiter(signal) {
+        let settled = false;
+        let rejectOnce = null;
+        let onAbort = null;
+        let cleanup = () => {};
+
+        const promise = new Promise((_, reject) => {
+            rejectOnce = (error) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(error);
+            };
+            cleanup = () => {
+                waiters.delete(rejectOnce);
+                if (onAbort && signal?.removeEventListener) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+            };
+            waiters.add(rejectOnce);
+
+            if (signal) {
+                onAbort = () => rejectOnce(new Error("aborted"));
+                if (signal.aborted) {
+                    onAbort();
+                } else {
+                    signal.addEventListener("abort", onAbort, {once: true});
+                }
+            }
+        });
+
+        return {promise, cleanup};
+    }
+
+    return {
+        get lastError() {
+            return lastError;
+        },
+        throwIfError() {
+            if (lastError) throw lastError;
+        },
+        async race(operation, signal) {
+            if (lastError) throw lastError;
+            const waiter = makeErrorWaiter(signal);
+            try {
+                return await Promise.race([operation, waiter.promise]);
+            } finally {
+                waiter.cleanup();
+            }
+        },
+        close() {
+            closed = true;
+            for (const reject of Array.from(waiters)) {
+                reject(new Error("aborted"));
+            }
+            waiters.clear();
+        },
+    };
+}
+
+function createImapClient(account, label) {
+    const client = new ImapFlow({
+        host: HOTMAIL_IMAP_HOST,
+        port: HOTMAIL_IMAP_PORT,
+        secure: true,
+        auth: {
+            user: account.loginHint,
+            accessToken: account.accessToken,
+        },
+        logger: false,
+        emitLogs: false,
+        proxy: account.proxyUrl ?? appConfig.defaultProxyUrl,
+    });
+
+    return {
+        client,
+        guard: protectImapClient(client, `${label}:${account.loginHint}`),
+    };
+}
+
+async function* guardedAsyncIterator(guard, iterable, signal) {
+    const iterator = iterable[Symbol.asyncIterator]();
+    let completed = false;
+    try {
+        for (;;) {
+            const item = await guard.race(iterator.next(), signal);
+            if (item.done) {
+                completed = true;
+                return;
+            }
+            yield item.value;
+        }
+    } finally {
+        if (!completed && typeof iterator.return === "function") {
+            try { await iterator.return(); } catch (_) { /* ignore */ }
+        }
+    }
+}
+
 function normalizeEmail(value) {
     return String(value ?? "").trim().toLowerCase();
 }
@@ -476,26 +596,15 @@ function mapFolderIdToImap(folderId) {
 
 async function listFolderMessagesViaImap(account, folderId) {
     const mailbox = mapFolderIdToImap(folderId);
-    const client = new ImapFlow({
-        host: HOTMAIL_IMAP_HOST,
-        port: HOTMAIL_IMAP_PORT,
-        secure: true,
-        auth: {
-            user: account.loginHint,
-            accessToken: account.accessToken,
-        },
-        logger: false,
-        emitLogs: false,
-        proxy: account.proxyUrl ?? appConfig.defaultProxyUrl,
-    });
+    const {client, guard} = createImapClient(account, `list:${folderId}`);
 
     const messages = [];
     try {
-        await client.connect();
+        await guard.race(client.connect());
         // 尝试解析实际的 mailbox 名（Outlook 上 Junk 真实路径可能是 "Junk Email"）
         let resolvedMailbox = mailbox;
         try {
-            const list = await client.list();
+            const list = await guard.race(client.list());
             const norm = (s) => String(s ?? "").toLowerCase();
             const match = list.find((b) => {
                 const p = norm(b.path);
@@ -505,7 +614,7 @@ async function listFolderMessagesViaImap(account, folderId) {
             if (match?.path) resolvedMailbox = match.path;
         } catch (_) { /* ignore */ }
 
-        const lock = await client.getMailboxLock(resolvedMailbox);
+        const lock = await guard.race(client.getMailboxLock(resolvedMailbox));
         try {
             const status = client.mailbox;
             const total = Number(status?.exists ?? 0);
@@ -514,11 +623,12 @@ async function listFolderMessagesViaImap(account, folderId) {
                 return [];
             }
             const seqStart = Math.max(1, total - HOTMAIL_MESSAGE_FETCH_LIMIT + 1);
-            for await (const msg of client.fetch(`${seqStart}:${total}`, {
+            const fetchStream = client.fetch(`${seqStart}:${total}`, {
                 envelope: true,
                 bodyStructure: false,
                 source: true,
-            }, {uid: false})) {
+            }, {uid: false});
+            for await (const msg of guardedAsyncIterator(guard, fetchStream)) {
                 const env = msg.envelope ?? {};
                 const fromAddr = (env.from?.[0]?.address ?? "").toLowerCase();
                 const toAddrs = Array.isArray(env.to)
@@ -558,6 +668,7 @@ async function listFolderMessagesViaImap(account, folderId) {
         }
     } finally {
         try { await client.logout(); } catch (_) { /* ignore */ }
+        guard.close();
     }
 
     messages.sort((a, b) => b.receivedAtMs - a.receivedAtMs);
@@ -709,10 +820,10 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
     const externalSignal = options.signal;
 
     // 解析真实 mailbox 路径
-    async function resolveMailboxPaths(client) {
+    async function resolveMailboxPaths(client, guard) {
         const paths = {inbox: "INBOX", junk: "Junk"};
         try {
-            const list = await client.list();
+            const list = guard ? await guard.race(client.list()) : await client.list();
             const norm = (s) => String(s ?? "").toLowerCase();
             for (const box of list) {
                 const p = norm(box.path);
@@ -726,18 +837,19 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
     }
 
     // 从当前 mailbox 拉最近邮件并匹配
-    async function fetchAndMatch(client) {
+    async function fetchAndMatch(client, guard, signal) {
         const status = client.mailbox;
         const total = Number(status?.exists ?? 0);
         if (!total) return null;
 
         const seqStart = Math.max(1, total - HOTMAIL_MESSAGE_FETCH_LIMIT + 1);
         const messages = [];
-        for await (const msg of client.fetch(`${seqStart}:${total}`, {
+        const fetchStream = client.fetch(`${seqStart}:${total}`, {
             envelope: true,
             bodyStructure: false,
             source: true,
-        }, {uid: false})) {
+        }, {uid: false});
+        for await (const msg of guardedAsyncIterator(guard, fetchStream, signal)) {
             const env = msg.envelope ?? {};
             const fromAddr = (env.from?.[0]?.address ?? "").toLowerCase();
             const toAddrs = Array.isArray(env.to)
@@ -796,25 +908,14 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
 
     // 在单个文件夹上做 IDLE 等待
     async function idleOnFolder(mailboxPath: string, signal: AbortSignal): Promise<string | null> {
-        const client = new ImapFlow({
-            host: HOTMAIL_IMAP_HOST,
-            port: HOTMAIL_IMAP_PORT,
-            secure: true,
-            auth: {
-                user: account.loginHint,
-                accessToken: account.accessToken,
-            },
-            logger: false,
-            emitLogs: false,
-            proxy: account.proxyUrl ?? appConfig.defaultProxyUrl,
-        });
+        const {client, guard} = createImapClient(account, `idle:${mailboxPath}`);
 
         try {
-            await client.connect();
-            const lock = await client.getMailboxLock(mailboxPath);
+            await guard.race(client.connect(), signal);
+            const lock = await guard.race(client.getMailboxLock(mailboxPath), signal);
             try {
                 // 先扫一次已有邮件
-                const existing = await fetchAndMatch(client);
+                const existing = await fetchAndMatch(client, guard, signal);
                 if (existing?.verificationCode) {
                     return existing.verificationCode;
                 }
@@ -824,18 +925,13 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
                     console.log(`hotmailIdle: waiting on ${mailboxPath} for ${targetEmail}...`);
                     // idle() 会阻塞直到有新事件或超时
                     // imapflow 的 idle() 在收到 EXISTS 等通知后自动 resolve
-                    await Promise.race([
-                        client.idle(),
-                        new Promise((_, reject) => {
-                            signal.addEventListener("abort", () => reject(new Error("aborted")), {once: true});
-                        }),
-                    ]);
+                    await guard.race(client.idle(), signal);
 
                     if (signal.aborted) break;
 
                     // 收到通知，立即 fetch
                     console.log(`hotmailIdle: new mail event on ${mailboxPath}, fetching...`);
-                    const result = await fetchAndMatch(client);
+                    const result = await fetchAndMatch(client, guard, signal);
                     if (result?.verificationCode) {
                         return result.verificationCode;
                     }
@@ -848,23 +944,21 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
             throw err;
         } finally {
             try { await client.logout(); } catch (_) { /* ignore */ }
+            guard.close();
         }
         return null;
     }
 
     // 并行在 INBOX + Junk 上 IDLE，任一找到验证码立即返回
-    const client0 = new ImapFlow({
-        host: HOTMAIL_IMAP_HOST,
-        port: HOTMAIL_IMAP_PORT,
-        secure: true,
-        auth: { user: account.loginHint, accessToken: account.accessToken },
-        logger: false,
-        emitLogs: false,
-        proxy: account.proxyUrl ?? appConfig.defaultProxyUrl,
-    });
-    await client0.connect();
-    const paths = await resolveMailboxPaths(client0);
-    try { await client0.logout(); } catch (_) { /* ignore */ }
+    const {client: client0, guard: client0Guard} = createImapClient(account, "resolve-mailboxes");
+    let paths = {inbox: "INBOX", junk: "Junk"};
+    try {
+        await client0Guard.race(client0.connect());
+        paths = await resolveMailboxPaths(client0, client0Guard);
+    } finally {
+        try { await client0.logout(); } catch (_) { /* ignore */ }
+        client0Guard.close();
+    }
 
     const folders = [paths.inbox, paths.junk];
     const controller = new AbortController();
@@ -877,19 +971,20 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
 
     try {
         if (externalSignal?.aborted) return null;
-        const result = await Promise.race(
+        const result = await firstResolvedCode(
             folders.map((folder) =>
                 idleOnFolder(folder, signal).catch((err) => {
                     console.warn(`hotmailIdle: ${folder} error: ${(err as Error).message}`);
                     return null;
                 })
-            )
+            ),
+            controller,
         );
 
-        controller.abort(); // 终止另一个 IDLE
         if (result) return result;
     } finally {
         clearTimeout(timeout);
+        controller.abort();
         externalSignal?.removeEventListener("abort", abortFromExternal);
     }
 
@@ -974,6 +1069,10 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
         async getEmailVerificationCode(email, options) {
             const account = await providerResolveAccount(email);
             const minTimestampMs = options?.minTimestampMs || 0;
+            const externalSignal = options?.signal;
+            if (externalSignal?.aborted) {
+                throw new Error("aborted");
+            }
             await ensureFreshAccount(account);
 
             console.log(`hotmailOtp: 使用 IMAP IDLE + 快速轮询并行等待 targetEmail=${email} mailbox=${account.loginHint}`);
@@ -1007,6 +1106,7 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
             const fallbackCode = await pollHotmailVerificationCode(email, account, minTimestampMs, {
                 attempts: 10,
                 intervalMs: 2000,
+                signal: externalSignal,
             });
             if (fallbackCode) {
                 return fallbackCode;

@@ -139,7 +139,6 @@ Docker 运行时会把项目目录挂载到 `/data`，因此 `config.toml`、邮
 [run]
 total = 1
 concurrency = 1
-max_phone_tries = 20
 use_browser_sentinel = false
 run_until_empty = false
 
@@ -149,12 +148,14 @@ save_auth_json = false
 
 [hero_sms]
 api_key = ""
-country = 33
-countries = []
+countries = [33]
+acquire_priority = "country"
+min_price = 0.45
 max_price = 0.5
-price_tiers = [0.45]
-poll_attempts = 15
+price_step = 0.01
 poll_interval_ms = 3000
+max_phone_tries = 20
+auto_release_on_timeout = true
 
 [email_pool]
 source = "email.txt"
@@ -169,6 +170,16 @@ dir = "cpa_json"
 [proxies]
 urls = []
 ```
+
+接码国家只配置 `countries`，单国家也写成一个元素的数组。`acquire_priority` 支持：
+
+- `country`：国家优先，每个国家按价格档位尝试。
+- `price_low`：低价优先，每个低价档位按国家顺序尝试。
+- `price_high`：高价优先，每个高价档位按国家顺序尝试。
+
+网页后台的国家选项会优先从 HeroSMS `getCountries` 接口获取，并永久缓存到 `.cache/hero-sms-countries.json`；接口失败时会继续使用旧缓存，没有缓存时才切换到内置兜底列表。点击“重新加载”会主动刷新这份缓存。
+
+`auto_release_on_timeout = true` 时，如果一个号码在固定轮询窗口内仍未收到验证码，会主动调用 HeroSMS 取消/释放该号码，然后换新号。最多轮询次数不支持配置，程序会按 `poll_interval_ms` 自动计算到超过 2 分钟；默认 `3000ms` 间隔下是 42 次。
 
 代理只从 `[proxies].urls` 读取。留空表示直连；配置多个代理时会按 worker 轮询负载均衡：
 
@@ -222,4 +233,3 @@ npm run update:sdk
 npm run typecheck
 npm test
 ```
-

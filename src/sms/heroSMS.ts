@@ -13,8 +13,8 @@ import type {
 } from "./provider.js";
 
 const HERO_SMS_DEFAULT_BASE_URL = "https://hero-sms.com/stubs/handler_api.php";
-const HERO_SMS_DEFAULT_POLL_ATTEMPTS = 24;
 const HERO_SMS_DEFAULT_POLL_INTERVAL_MS = 5000;
+const HERO_SMS_CANCEL_AND_WITHDRAW_MIN_AGE_MS = 2 * 60 * 1000;
 const HERO_SMS_CODE_PATTERN = /(?<!\d)(\d{4,8})(?!\d)/;
 
 interface DeliveredActivationSnapshot {
@@ -45,8 +45,8 @@ export interface HeroSmsProviderConfig {
   baseUrl?: string;
   proxyUrl?: string;
   timeoutMs?: number;
-  pollAttempts?: number;
   pollIntervalMs?: number;
+  cancelAndWithdrawMinAgeMs?: number;
   defaultRequestOptions?: HeroSmsNumberRequestOptions;
   defaultWaitForCodeOptions?: HeroSmsWaitForCodeOptions;
 }
@@ -106,11 +106,18 @@ export interface HeroSmsBalance {
   raw: unknown;
 }
 
+export interface HeroSmsCountry {
+  id: number;
+  label: string;
+  raw: unknown;
+}
+
 export interface HeroSmsWaitForCodeOptions {
   markReady?: boolean;
   completeOnCode?: boolean;
-  pollAttempts?: number;
+  autoReleaseOnTimeout?: boolean;
   pollIntervalMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface HeroSmsAcquireAndWaitOptions extends HeroSmsWaitForCodeOptions {
@@ -134,6 +141,7 @@ export interface HeroSmsProvider extends SmsProvider<
     activationId: string | number,
   ): Promise<string | HeroSmsStatusPayload>;
   getBalance(): Promise<HeroSmsBalance>;
+  getCountries(): Promise<HeroSmsCountry[]>;
   waitForVerificationCode(
     activationId: string | number,
     options?: HeroSmsWaitForCodeOptions,
@@ -161,6 +169,17 @@ export class HeroSmsApiError extends Error {
     this.action = action;
     this.httpStatus = options.httpStatus;
     this.payload = options.payload;
+  }
+}
+
+export class HeroSmsActivationReleasedError extends Error {
+  readonly activationId: string;
+  readonly releaseActivation = true;
+
+  constructor(activationId: string, message: string) {
+    super(message);
+    this.name = "HeroSmsActivationReleasedError";
+    this.activationId = activationId;
   }
 }
 
@@ -352,6 +371,55 @@ function createApiError(
   return new HeroSmsApiError(action, message, { httpStatus, payload });
 }
 
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    const normalized = String(value ?? "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function normalizeCountryId(value: unknown): number {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function countryLabelFromRecord(record: Record<string, unknown>, id: number): string {
+  const english = firstString(record.eng, record.title, record.name_en, record.name, record.country, record.label);
+  const chinese = firstString(record.chn, record.name_cn, record.cn);
+  if (chinese && english && chinese.toLowerCase() !== english.toLowerCase()) {
+    return `${chinese} (${english})`;
+  }
+  return chinese || english || `Country #${id}`;
+}
+
+export function normalizeHeroSmsCountries(payload: unknown): HeroSmsCountry[] {
+  const countrySource = isRecord(payload) && "value" in payload ? payload.value : payload;
+  const entries = Array.isArray(countrySource)
+    ? countrySource.map((value, index) => [String(index), value] as const)
+    : isRecord(countrySource)
+      ? Object.entries(countrySource)
+      : [];
+  const seen = new Set<number>();
+  const countries: HeroSmsCountry[] = [];
+
+  for (const [key, item] of entries) {
+    const id = isRecord(item)
+      ? normalizeCountryId(item.id ?? item.countryId ?? item.country ?? key)
+      : normalizeCountryId(key);
+    if (!id || seen.has(id)) continue;
+
+    const label = isRecord(item) ? countryLabelFromRecord(item, id) : `Country #${id}`;
+    seen.add(id);
+    countries.push({id, label, raw: item});
+  }
+
+  countries.sort((left, right) => left.label.localeCompare(right.label));
+  return countries;
+}
+
 function parseBalanceAmount(value: unknown): number | null {
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : null;
@@ -399,6 +467,35 @@ export function normalizeHeroSmsBalance(payload: unknown): HeroSmsBalance {
   }
 
   throw new Error(`HeroSMS getBalance 返回格式异常: ${formatPayload(payload)}`);
+}
+
+async function requestHeroSmsCountriesApi(
+  config: HeroSmsProviderConfig,
+): Promise<unknown> {
+  const url = new URL(normalizeBaseUrl(config));
+  const apiKey = String(config.apiKey ?? "").trim();
+  url.searchParams.set("action", "getCountries");
+  if (apiKey) {
+    url.searchParams.set("api_key", apiKey);
+  }
+
+  const response = await heroSmsFetch(config, url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json, text/plain;q=0.9, */*;q=0.8",
+    },
+  });
+  const payload = await readResponseBody(response);
+
+  if (!response.ok) {
+    throw createApiError("getCountries", payload, response.status);
+  }
+
+  if (isApiErrorPayload(payload) || isFailureString(payload)) {
+    throw createApiError("getCountries", payload, response.status);
+  }
+
+  return payload;
 }
 
 async function requestHeroSmsApi(
@@ -753,15 +850,17 @@ async function fetchActiveActivation(
   return matched ?? null;
 }
 
-function resolvePollAttempts(
-  config: HeroSmsProviderConfig,
-  options?: HeroSmsWaitForCodeOptions,
+export function fixedHeroSmsPollAttempts(
+  pollIntervalMs: number,
+  cancelAndWithdrawMinAgeMs = HERO_SMS_CANCEL_AND_WITHDRAW_MIN_AGE_MS,
 ): number {
-  const attempts =
-    options?.pollAttempts ??
-    config.pollAttempts ??
-    HERO_SMS_DEFAULT_POLL_ATTEMPTS;
-  return attempts > 0 ? Math.floor(attempts) : HERO_SMS_DEFAULT_POLL_ATTEMPTS;
+  const intervalMs = pollIntervalMs > 0
+    ? Math.floor(pollIntervalMs)
+    : HERO_SMS_DEFAULT_POLL_INTERVAL_MS;
+  const minAgeMs = cancelAndWithdrawMinAgeMs > 0
+    ? Math.floor(cancelAndWithdrawMinAgeMs)
+    : 0;
+  return Math.max(1, Math.floor(minAgeMs / intervalMs) + 2);
 }
 
 function resolvePollIntervalMs(
@@ -777,18 +876,61 @@ function resolvePollIntervalMs(
     : HERO_SMS_DEFAULT_POLL_INTERVAL_MS;
 }
 
-function delay(ms: number): Promise<void> {
+function abortError(): Error {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortError();
+  }
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, {once: true});
   });
 }
 
+function resolveCancelAndWithdrawMinAgeMs(config: HeroSmsProviderConfig): number {
+  const minAgeMs =
+    config.cancelAndWithdrawMinAgeMs ??
+    HERO_SMS_CANCEL_AND_WITHDRAW_MIN_AGE_MS;
+  return Number.isFinite(minAgeMs) && minAgeMs > 0 ? Math.floor(minAgeMs) : 0;
+}
+
+function remainingCancelAndWithdrawDelayMs(
+  activationStartedAtById: Map<string, Date>,
+  activationId: string,
+  waitStartedAt: Date,
+  minAgeMs: number,
+): number {
+  if (minAgeMs <= 0) {
+    return 0;
+  }
+  const startedAt = activationStartedAtById.get(activationId) ?? waitStartedAt;
+  const startedAtMs = startedAt.getTime();
+  if (!Number.isFinite(startedAtMs)) {
+    return 0;
+  }
+  return Math.max(0, minAgeMs - (Date.now() - startedAtMs));
+}
+
 export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
-  ensureApiKeyConfigured(config);
   const deliveredActivationSnapshotById = new Map<
     string,
     DeliveredActivationSnapshot
   >();
+  const activationStartedAtById = new Map<string, Date>();
 
   const provider: HeroSmsProvider = {
     async requestActivation(): Promise<HeroSmsActivation> {
@@ -810,7 +952,9 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         phoneException: normalizeListValue(options.phoneException),
       });
 
-      return normalizeActivation(payload);
+      const activation = normalizeActivation(payload);
+      activationStartedAtById.set(activation.activationId, new Date());
+      return activation;
     },
 
     async markActivationReady(activationId: string | number): Promise<string> {
@@ -838,6 +982,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         status: 6,
       });
       deliveredActivationSnapshotById.delete(normalizedActivationId);
+      activationStartedAtById.delete(normalizedActivationId);
 
       return String(payload);
     },
@@ -849,6 +994,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         status: 8,
       });
       deliveredActivationSnapshotById.delete(normalizedActivationId);
+      activationStartedAtById.delete(normalizedActivationId);
 
       return String(payload);
     },
@@ -880,11 +1026,21 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
       return normalizeHeroSmsBalance(payload);
     },
 
+    async getCountries(): Promise<HeroSmsCountry[]> {
+      const payload = await requestHeroSmsCountriesApi(config);
+      const countries = normalizeHeroSmsCountries(payload);
+      if (!countries.length) {
+        throw new Error(`HeroSMS getCountries 返回国家列表为空: ${formatPayload(payload)}`);
+      }
+      return countries;
+    },
+
     async waitForVerificationCode(
       activationId: string | number,
       options: HeroSmsWaitForCodeOptions = {},
     ): Promise<HeroSmsVerificationCode> {
       const normalizedActivationId = normalizeActivationId(activationId);
+      const waitStartedAt = new Date();
       const lastDeliveredActivationSnapshot =
         deliveredActivationSnapshotById.get(normalizedActivationId);
       const waitOptions = {
@@ -893,15 +1049,22 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
       };
       const shouldMarkReady = waitOptions.markReady ?? false;
       const shouldCompleteOnCode = waitOptions.completeOnCode ?? false;
-      const pollAttempts = resolvePollAttempts(config, waitOptions);
+      const shouldAutoReleaseOnTimeout = waitOptions.autoReleaseOnTimeout ?? false;
       const pollIntervalMs = resolvePollIntervalMs(config, waitOptions);
+      const pollAttempts = fixedHeroSmsPollAttempts(
+        pollIntervalMs,
+        resolveCancelAndWithdrawMinAgeMs(config),
+      );
+      const signal = waitOptions.signal;
       let lastStatus: unknown;
 
+      throwIfAborted(signal);
       if (shouldMarkReady) {
         await provider.markActivationReady(normalizedActivationId);
       }
 
       for (let attempt = 1; attempt <= pollAttempts; attempt += 1) {
+        throwIfAborted(signal);
         console.log(`[pollSMSCode]: attempt:${attempt}/${pollAttempts}`);
         // 这基于一个假设，heroSMS 不会同时有太多正在激活的 activation（小于 20），这样可以精确获取状态
         const activeActivation = await fetchActiveActivation(
@@ -938,6 +1101,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         const statusV2 = await provider.getActivationStatusV2(
           normalizedActivationId,
         );
+        throwIfAborted(signal);
         const codeFromV2 = extractCodeFromStatusPayload(statusV2);
         if (codeFromV2 && !activeActivation) {
           if (!lastDeliveredActivationSnapshot) {
@@ -956,6 +1120,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         const status = await provider.getActivationStatus(
           normalizedActivationId,
         );
+        throwIfAborted(signal);
         lastStatus = status;
 
         const codeFromStatus = extractCodeFromStatusPayload(status);
@@ -975,12 +1140,37 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
         }
 
         if (attempt < pollAttempts) {
-          await delay(pollIntervalMs);
+          await delay(pollIntervalMs, signal);
         }
       }
-      throw new Error(
-        `HeroSMS 长时间未收到验证码: activationId=${normalizedActivationId} lastStatus=${formatPayload(lastStatus)}`,
-      );
+      throwIfAborted(signal);
+      const message = `HeroSMS 长时间未收到验证码: activationId=${normalizedActivationId} lastStatus=${formatPayload(lastStatus)}`;
+      if (shouldAutoReleaseOnTimeout) {
+        try {
+          const remainingMs = remainingCancelAndWithdrawDelayMs(
+            activationStartedAtById,
+            normalizedActivationId,
+            waitStartedAt,
+            resolveCancelAndWithdrawMinAgeMs(config),
+          );
+          if (remainingMs > 0) {
+            console.warn(
+              `[heroSMS] 轮询超时，等待号码满足最小释放时间 activationId=${normalizedActivationId} remainingMs=${remainingMs}`,
+            );
+            await delay(remainingMs, signal);
+            throwIfAborted(signal);
+          }
+          const releaseResult = await provider.cancelAndWithdraw(normalizedActivationId);
+          console.warn(`[heroSMS] 轮询超时，已自动释放号码 activationId=${normalizedActivationId} result=${releaseResult}`);
+          throw new HeroSmsActivationReleasedError(normalizedActivationId, `${message}; 已自动释放号码`);
+        } catch (error) {
+          if (error instanceof HeroSmsActivationReleasedError) {
+            throw error;
+          }
+          throw new Error(`${message}; 自动释放号码失败: ${(error as Error).message}`);
+        }
+      }
+      throw new Error(message);
     },
   };
 

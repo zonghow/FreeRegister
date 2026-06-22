@@ -13,13 +13,17 @@ export interface SmsVerificationCode {
   rawStatus?: unknown;
 }
 
+export interface SmsWaitForCodeOptions {
+  signal?: AbortSignal;
+}
+
 export interface SmsProvider<
   Activation extends SmsActivation = SmsActivation,
   Verification extends SmsVerificationCode = SmsVerificationCode,
 > {
   requestActivation(): Promise<Activation>;
   requestAnotherSms(activationId: string): Promise<string>;
-  waitForVerificationCode(activationId: string): Promise<Verification>;
+  waitForVerificationCode(activationId: string, options?: SmsWaitForCodeOptions): Promise<Verification>;
   completeActivation(activationId: string): Promise<string>;
   cancelAndWithdraw(activationId: string): Promise<string>;
   cancelActivation(activationId: string): Promise<string>;

@@ -17,7 +17,12 @@ run_until_empty = true
 urls = ["socks5://a", "http://b"]
 
 [hero_sms]
-price_tiers = [0.04, 0.05]
+countries = [33, 52]
+acquire_priority = "price_high"
+min_price = 0.04
+max_price = 0.08
+price_step = 0.02
+auto_release_on_timeout = true
 `);
 
     assert.equal(parsed.run.total, 100);
@@ -25,7 +30,9 @@ price_tiers = [0.04, 0.05]
     assert.equal(parsed.run.use_browser_sentinel, true);
     assert.equal(parsed.run.run_until_empty, true);
     assert.deepEqual(parsed.proxies.urls, ["socks5://a", "http://b"]);
-    assert.deepEqual(parsed.hero_sms.price_tiers, [0.04, 0.05]);
+    assert.deepEqual(parsed.hero_sms.countries, [33, 52]);
+    assert.equal(parsed.hero_sms.acquire_priority, "price_high");
+    assert.equal(parsed.hero_sms.auto_release_on_timeout, true);
 });
 
 test("loads config defaults and applies cli overrides", async () => {
@@ -45,10 +52,15 @@ save_auth_json = true
 
 [hero_sms]
 api_key = "hero"
-country = 33
+countries = [33, 52]
+acquire_priority = "price_low"
+min_price = 0.04
 max_price = 0.08
-poll_attempts = 15
+price_step = 0.02
+poll_attempts = 1
 poll_interval_ms = 3000
+max_phone_tries = 9
+auto_release_on_timeout = false
 
 [proxies]
 urls = ["socks5://one", "socks5://two"]
@@ -68,6 +80,14 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.total, 5);
         assert.equal(overridden.run.concurrency, 3);
         assert.equal(overridden.run.maxPhoneTries, 7);
+        assert.deepEqual(overridden.heroSMS.countries, [33, 52]);
+        assert.equal(overridden.heroSMS.acquirePriority, "price_low");
+        assert.equal(overridden.heroSMS.minPrice, 0.04);
+        assert.equal(overridden.heroSMS.maxPrice, 0.08);
+        assert.equal(overridden.heroSMS.priceStep, 0.02);
+        assert.equal(Object.prototype.hasOwnProperty.call(overridden.heroSMS, "pollAttempts"), false);
+        assert.equal(overridden.heroSMS.maxPhoneTries, 9);
+        assert.equal(overridden.heroSMS.autoReleaseOnTimeout, false);
         assert.equal(untilEmpty.run.runUntilEmpty, true);
         assert.equal(overridden.openai.defaultPassword, "pw");
         assert.equal(overridden.openai.saveAuthJson, true);
@@ -137,6 +157,31 @@ urls = ["socks5://from-file"]
         assert.equal(loaded.emailPool.lock, path.join(poolDir, ".email.lock"));
     } finally {
         restoreEnv();
+        await rm(dir, {recursive: true, force: true});
+    }
+});
+
+test("loads legacy hero sms country and price tiers", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-config-legacy-"));
+    try {
+        const configPath = path.join(dir, "config.toml");
+        await writeFile(configPath, `
+[run]
+max_phone_tries = 6
+
+[hero_sms]
+country = 52
+price_tiers = [0.03, 0.05]
+max_price = 0.08
+`);
+
+        const loaded = loadConfig(configPath);
+
+        assert.deepEqual(loaded.heroSMS.countries, [52]);
+        assert.equal(loaded.heroSMS.minPrice, 0.03);
+        assert.equal(loaded.heroSMS.maxPrice, 0.08);
+        assert.equal(loaded.heroSMS.maxPhoneTries, 6);
+    } finally {
         await rm(dir, {recursive: true, force: true});
     }
 });

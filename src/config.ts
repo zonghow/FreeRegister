@@ -17,12 +17,14 @@ export interface OpenAIConfig {
 
 export interface HeroSMSConfig {
     apiKey: string;
-    country: number;
-    countries?: number[];
+    countries: number[];
+    acquirePriority: "country" | "price_low" | "price_high";
+    minPrice: number;
     maxPrice: number;
-    priceTiers?: number[];
-    pollAttempts: number;
+    priceStep: number;
     pollIntervalMs: number;
+    maxPhoneTries: number;
+    autoReleaseOnTimeout: boolean;
 }
 
 export interface EmailPoolConfig {
@@ -76,11 +78,14 @@ const DEFAULT_CONFIG: AppConfig = {
     },
     heroSMS: {
         apiKey: "",
-        country: 33,
-        maxPrice: 0.08,
-        priceTiers: [0.045, 0.05, 0.055, 0.06, 0.065, 0.07, 0.075, 0.08],
-        pollAttempts: 15,
+        countries: [33],
+        acquirePriority: "country",
+        minPrice: 0.45,
+        maxPrice: 0.5,
+        priceStep: 0.01,
         pollIntervalMs: 3000,
+        maxPhoneTries: 20,
+        autoReleaseOnTimeout: true,
     },
     emailPool: {
         source: "email.txt",
@@ -231,14 +236,26 @@ function stringArrayValue(value: TomlValue | undefined): string[] {
     return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean) : [];
 }
 
-function numberArrayValue(value: TomlValue | undefined): number[] | undefined {
-    if (!Array.isArray(value)) return undefined;
+function numberArrayValue(value: TomlValue | undefined): number[] {
+    if (!Array.isArray(value)) return [];
     const items = value.filter((item): item is number => typeof item === "number" && Number.isFinite(item));
-    return items.length ? items : undefined;
+    return items;
+}
+
+function positiveNumber(value: number, fallback: number): number {
+    return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function positiveInteger(value: number, fallback: number): number {
     return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function normalizeAcquirePriority(value: TomlValue | undefined, fallback: HeroSMSConfig["acquirePriority"]): HeroSMSConfig["acquirePriority"] {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (normalized === "country") return "country";
+    if (normalized === "price" || normalized === "price_low") return "price_low";
+    if (normalized === "price_high") return "price_high";
+    return fallback;
 }
 
 function pathValue(value: TomlValue | undefined, fallback: string, baseDir: string): string {
@@ -296,6 +313,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         heroSMS: {
             ...config.heroSMS,
             apiKey: heroSMSApiKey || config.heroSMS.apiKey,
+            maxPhoneTries: maxPhoneTries ?? config.heroSMS.maxPhoneTries,
         },
         openai: {
             ...config.openai,
@@ -347,24 +365,35 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         defaultPassword: stringValue(openai.default_password, DEFAULT_CONFIG.openai.defaultPassword),
         saveAuthJson: booleanValue(openai.save_auth_json, DEFAULT_CONFIG.openai.saveAuthJson),
     };
+    const runMaxPhoneTries = positiveInteger(numberValue(run.max_phone_tries, DEFAULT_CONFIG.run.maxPhoneTries), DEFAULT_CONFIG.run.maxPhoneTries);
+    const configuredCountries = numberArrayValue(hero.countries);
+    const legacyCountry = positiveInteger(numberValue(hero.country, DEFAULT_CONFIG.heroSMS.countries[0] ?? 33), DEFAULT_CONFIG.heroSMS.countries[0] ?? 33);
+    const legacyPriceTiers = numberArrayValue(hero.price_tiers);
+    const minPrice = positiveNumber(
+        numberValue(hero.min_price, legacyPriceTiers.length ? Math.min(...legacyPriceTiers) : DEFAULT_CONFIG.heroSMS.minPrice),
+        DEFAULT_CONFIG.heroSMS.minPrice,
+    );
+    const maxPrice = positiveNumber(numberValue(hero.max_price, DEFAULT_CONFIG.heroSMS.maxPrice), DEFAULT_CONFIG.heroSMS.maxPrice);
 
     const config: AppConfig = {
         run: {
             total: positiveInteger(numberValue(run.total, DEFAULT_CONFIG.run.total), DEFAULT_CONFIG.run.total),
             concurrency: positiveInteger(numberValue(run.concurrency, DEFAULT_CONFIG.run.concurrency), DEFAULT_CONFIG.run.concurrency),
-            maxPhoneTries: positiveInteger(numberValue(run.max_phone_tries, DEFAULT_CONFIG.run.maxPhoneTries), DEFAULT_CONFIG.run.maxPhoneTries),
+            maxPhoneTries: runMaxPhoneTries,
             useBrowserSentinel: booleanValue(run.use_browser_sentinel, DEFAULT_CONFIG.run.useBrowserSentinel),
             runUntilEmpty: booleanValue(run.run_until_empty, DEFAULT_CONFIG.run.runUntilEmpty),
         },
         openai: openAIConfig,
         heroSMS: {
             apiKey: stringValue(hero.api_key, DEFAULT_CONFIG.heroSMS.apiKey),
-            country: positiveInteger(numberValue(hero.country, DEFAULT_CONFIG.heroSMS.country), DEFAULT_CONFIG.heroSMS.country),
-            countries: numberArrayValue(hero.countries),
-            maxPrice: numberValue(hero.max_price, DEFAULT_CONFIG.heroSMS.maxPrice),
-            priceTiers: numberArrayValue(hero.price_tiers),
-            pollAttempts: positiveInteger(numberValue(hero.poll_attempts, DEFAULT_CONFIG.heroSMS.pollAttempts), DEFAULT_CONFIG.heroSMS.pollAttempts),
+            countries: configuredCountries.length ? configuredCountries : [legacyCountry],
+            acquirePriority: normalizeAcquirePriority(hero.acquire_priority, DEFAULT_CONFIG.heroSMS.acquirePriority),
+            minPrice,
+            maxPrice,
+            priceStep: positiveNumber(numberValue(hero.price_step, DEFAULT_CONFIG.heroSMS.priceStep), DEFAULT_CONFIG.heroSMS.priceStep),
             pollIntervalMs: positiveInteger(numberValue(hero.poll_interval_ms, DEFAULT_CONFIG.heroSMS.pollIntervalMs), DEFAULT_CONFIG.heroSMS.pollIntervalMs),
+            maxPhoneTries: positiveInteger(numberValue(hero.max_phone_tries, runMaxPhoneTries), runMaxPhoneTries),
+            autoReleaseOnTimeout: booleanValue(hero.auto_release_on_timeout, DEFAULT_CONFIG.heroSMS.autoReleaseOnTimeout),
         },
         emailPool: {
             source: stringValue(emailPool.source, DEFAULT_CONFIG.emailPool.source),
@@ -407,6 +436,10 @@ export function applyCliOverrides(config: AppConfig, argv = process.argv.slice(2
             concurrency: concurrency ?? config.run.concurrency,
             maxPhoneTries: maxPhoneTries ?? config.run.maxPhoneTries,
             runUntilEmpty,
+        },
+        heroSMS: {
+            ...config.heroSMS,
+            maxPhoneTries: maxPhoneTries ?? config.heroSMS.maxPhoneTries,
         },
     };
 }

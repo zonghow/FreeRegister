@@ -210,6 +210,7 @@ export interface OpenAIClientOptions {
     sentinelBrowserPath?: string;
     saveAuthJson?: boolean;
     authJsonDir?: string;
+    abortSignal?: AbortSignal;
     /**
      * 当 OAuth 登录流程要求 add-email（phone-only 账号 codex CLI OAuth）时，
      * 用这个 email 提交 add-email/send，并通过 fetchAddEmailOtp 接 OTP。
@@ -240,6 +241,7 @@ export class OpenAIClient {
     readonly sentinelBrowserPath?: string;
     readonly saveAuthJson: boolean;
     readonly authJsonDir: string;
+    readonly abortSignal?: AbortSignal;
 
     constructor(options: OpenAIClientOptions) {
         this.smsBroker = options.smsBroker;
@@ -250,6 +252,7 @@ export class OpenAIClient {
         this.sentinelBrowserPath = options.sentinelBrowserPath?.trim() || undefined;
         this.saveAuthJson = options.saveAuthJson ?? true;
         this.authJsonDir = options.authJsonDir?.trim() || "auth";
+        this.abortSignal = options.abortSignal;
         this.email = options.email?.trim() ?? "";
         this.password = options.password;
         this.deviceProfile = options.deviceProfile
@@ -270,6 +273,7 @@ export class OpenAIClient {
         const dispatcherFetch = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
             undiciFetch(input as Parameters<typeof undiciFetch>[0], {
                 ...(init as Parameters<typeof undiciFetch>[1]),
+                signal: this.mergeAbortSignal((init as Parameters<typeof undiciFetch>[1] | undefined)?.signal),
                 dispatcher: this.dispatcher,
             })) as unknown as FetchLike;
         const cookieFetch = makeFetchCookie(dispatcherFetch, this.jar) as FetchLike;
@@ -281,7 +285,33 @@ export class OpenAIClient {
         console.log(`[${current}/${total}] ${message}`);
     }
 
+    private throwIfAborted(): void {
+        if (this.abortSignal?.aborted) {
+            const error = new Error("任务已被强制暂停");
+            error.name = "AbortError";
+            throw error;
+        }
+    }
+
+    private mergeAbortSignal(signal?: AbortSignal | null): AbortSignal | undefined {
+        if (!this.abortSignal) {
+            return signal ?? undefined;
+        }
+        if (!signal || signal === this.abortSignal) {
+            return this.abortSignal;
+        }
+        if (signal.aborted || this.abortSignal.aborted) {
+            return AbortSignal.abort();
+        }
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal.addEventListener("abort", abort, {once: true});
+        this.abortSignal.addEventListener("abort", abort, {once: true});
+        return controller.signal;
+    }
+
     async authLoginHTTP(): Promise<AuthLoginResult> {
+        this.throwIfAborted();
         const totalSteps = 6;
         this.logProgress(1, totalSteps, "打开登录授权页");
         const oauthUrl = this.prepareManualLogin();
@@ -828,6 +858,7 @@ export class OpenAIClient {
         phoneNumber: string,
         fetchPhoneCode: () => Promise<string>,
     ): Promise<{callbackURL: string}> {
+        this.throwIfAborted();
         if (!phoneNumber.startsWith("+")) {
             throw new Error(`phoneNumber 必须包含国家码前缀，比如 +57xxx, got: ${phoneNumber}`);
         }
@@ -841,11 +872,13 @@ export class OpenAIClient {
         // Step 1: 打开 chatgpt.com web authorize 页（带 login_hint=+phone）
         this.logProgress(1, totalSteps, `打开 ChatGPT 网页授权页 (phone=${phoneNumber})`);
         await this.openChatGPTWebAuthorizePage(phoneNumber);
+        this.throwIfAborted();
 
         // Step 2: POST /api/accounts/user/register
         // 复用 registerPassword 但 username 是 phone（不是 email）
         this.logProgress(2, totalSteps, `提交手机号注册`);
         const sentinelToken1 = await this.fetchSentinelToken("username_password_create");
+        this.throwIfAborted();
         const respReg = await this.postJSON(
             AUTH_REGISTER_URL,
             {password: this.password, username: phoneNumber},
@@ -863,10 +896,12 @@ export class OpenAIClient {
         // Step 3: GET /api/accounts/phone-otp/send 触发 SMS
         this.logProgress(3, totalSteps, `触发 phone OTP 发送`);
         await this.sendPhoneOtpForSignup();
+        this.throwIfAborted();
 
         // Step 4: 等待外部 OTP 输入，POST /api/accounts/phone-otp/validate
         this.logProgress(4, totalSteps, `等待 phone OTP`);
         const code = await fetchPhoneCode();
+        this.throwIfAborted();
         if (!code) {
             throw new Error("phone OTP 未提供");
         }
@@ -880,6 +915,7 @@ export class OpenAIClient {
             throw new Error(`PhoneSignupValidate请求失败: ${await this.formatErrorResponse(respValidate)}`);
         }
         await respValidate.json();
+        this.throwIfAborted();
 
         // Step 5: 完成 about-you (create_account)
         this.logProgress(5, totalSteps, `填写基础资料并完成注册`);
@@ -1767,10 +1803,14 @@ export class OpenAIClient {
     ): Promise<Response> {
         let lastError: unknown;
         for (let attempt = 1; attempt <= FETCH_RETRY_COUNT; attempt++) {
+            this.throwIfAborted();
             try {
                 return await baseFetch(input, init);
             } catch (error) {
                 lastError = error;
+                if (this.abortSignal?.aborted) {
+                    this.throwIfAborted();
+                }
                 if (!isRetryableFetchError(error) || attempt >= FETCH_RETRY_COUNT) {
                     throw error;
                 }
@@ -1778,7 +1818,7 @@ export class OpenAIClient {
                     `[网络重试 ${attempt}/${FETCH_RETRY_COUNT}] ${this.describeRetryTarget(input)} ${this.describeRetryError(error)}`,
                 );
                 console.log(`[延迟] 网络重试等待 ${FETCH_RETRY_DELAY_MS * attempt}ms`);
-                await sleep(FETCH_RETRY_DELAY_MS * attempt);
+                await sleep(FETCH_RETRY_DELAY_MS * attempt, this.abortSignal);
             }
         }
         throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -1850,6 +1890,15 @@ function collectErrorMessages(error: unknown): string[] {
     return messages;
 }
 
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve();
+        }, {once: true});
+    });
 }

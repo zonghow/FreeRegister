@@ -3,7 +3,6 @@
 [run]
 total = 1
 concurrency = 1
-max_phone_tries = 20
 use_browser_sentinel = false
 run_until_empty = false
 
@@ -14,15 +13,19 @@ default_password = "change-this-password"
 save_auth_json = false
 
 # HeroSMS 接码配置。
-# countries 非空时会按列表轮询国家；为空时使用 country。
+# countries 按顺序尝试；网页国家选项会优先从 HeroSMS getCountries 接口获取并永久缓存。
+# acquire_priority 可选 country / price_low / price_high。
 [hero_sms]
 api_key = ""
-country = 33
-countries = []
+countries = [33]
+acquire_priority = "country"
+min_price = 0.45
 max_price = 0.5
-price_tiers = [0.45]
-poll_attempts = 15
+price_step = 0.01
+# 最多轮询次数由程序按 poll_interval_ms 自动计算到超过 2 分钟，不支持配置。
 poll_interval_ms = 3000
+max_phone_tries = 20
+auto_release_on_timeout = true
 
 # 邮箱池文件。
 # 并发读写会通过 lock 文件串行化；不要手动删除 inflight，除非确认任务已停止。
