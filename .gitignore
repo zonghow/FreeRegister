@@ -14,5 +14,6 @@ auth/
 hotmail/
 cpa_json/
 .cache/
+backups/
 *.bak
 *.tmp
