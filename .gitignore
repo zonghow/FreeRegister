@@ -11,6 +11,8 @@ email.success.txt
 email.inflight.txt
 email.failed.txt
 .email.lock
+cost.success.jsonl
+.cost.lock
 auth/
 hotmail/
 cpa_json/

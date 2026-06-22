@@ -50,6 +50,25 @@ export interface ActivationBrokerHistoryStats {
   phoneStats: Record<string, PhoneUsageStats>;
 }
 
+export type ActivationCostStatus = "active" | "completed" | "refunded" | "discarded";
+
+export interface ActivationCostEntry {
+  activationId: string;
+  phoneNumber: string;
+  cost: number;
+  refundCost: number;
+  status: ActivationCostStatus;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ActivationCostSummary {
+  grossCost: number;
+  refundCost: number;
+  netCost: number;
+  activations: ActivationCostEntry[];
+}
+
 export interface ActivationLease extends SmsActivation {
   isNewActivation: boolean;
   requestedAnotherSms: boolean;
@@ -61,6 +80,7 @@ export interface ISMSActivationBroker {
   getActivation(): Promise<ActivationLease>;
   markAsSucceed(): Promise<void>;
   markAsFailed(rotate?: boolean): Promise<void>;
+  getCostSummary(): ActivationCostSummary;
 }
 
 export interface ActivationBrokerState<Activation extends SmsActivation> {
@@ -106,6 +126,7 @@ export class ActivationBroker<
   private usage: ActivationUsageStats | null = null;
   private lastReleasedUsage: ActivationUsageStats | null = null;
   private activations: ActivationUsageStats[] = []
+  private readonly activationCosts = new Map<string, ActivationCostEntry>();
   private history: ActivationBrokerHistoryStats = {
     totalActivationsAllocated: 0,
     totalAttemptsStarted: 0,
@@ -147,6 +168,18 @@ export class ActivationBroker<
           { ...stats },
         ]),
       ),
+    };
+  }
+
+  getCostSummary(): ActivationCostSummary {
+    const activations = Array.from(this.activationCosts.values()).map((entry) => ({...entry}));
+    const grossCost = roundCost(activations.reduce((sum, entry) => sum + entry.cost, 0));
+    const refundCost = roundCost(activations.reduce((sum, entry) => sum + entry.refundCost, 0));
+    return {
+      grossCost,
+      refundCost,
+      netCost: roundCost(Math.max(0, grossCost - refundCost)),
+      activations,
     };
   }
 
@@ -272,6 +305,7 @@ export class ActivationBroker<
     const activation = this.requireCurrentActivation();
     try {
       const result = await this.provider.completeActivation(activation.activationId);
+      this.recordActivationCostRelease(activation.activationId, "completed");
       this.history.totalCompletedActivations += 1;
       this.recordPhoneRelease(activation.phoneNumber, "complete");
       return result;
@@ -284,8 +318,9 @@ export class ActivationBroker<
     const activation = this.requireCurrentActivation();
     try {
       const result = await this.provider.cancelActivation(activation.activationId);
-      this.history.totalDiscardedActivations += 1;
-      this.recordPhoneRelease(activation.phoneNumber, "discard");
+      this.recordActivationCostRelease(activation.activationId, "refunded");
+      this.history.totalWithdrawnActivations += 1;
+      this.recordPhoneRelease(activation.phoneNumber, "withdraw");
       return result;
     } finally {
       this.reset();
@@ -294,6 +329,7 @@ export class ActivationBroker<
 
   discardCurrentActivation(): void {
     if (this.currentActivation) {
+      this.recordActivationCostRelease(this.currentActivation.activationId, "discarded");
       this.history.totalDiscardedActivations += 1;
       this.recordPhoneRelease(this.currentActivation.phoneNumber, "discard");
     }
@@ -347,6 +383,7 @@ export class ActivationBroker<
     this.round = 1;
     this.history.totalActivationsAllocated += 1;
     this.recordPhoneActivation(activation.phoneNumber, activation.activationId);
+    this.recordActivationCost(activation);
     this.usage = {
       activationId: activation.activationId,
       phoneNumber: activation.phoneNumber,
@@ -369,6 +406,7 @@ export class ActivationBroker<
       phoneNumber: activation.phoneNumber,
       expiresAt: activation.expiresAt,
       canRequestAnotherSms: activation.canRequestAnotherSms,
+      activationCost: activation.activationCost,
       isNewActivation,
       requestedAnotherSms,
       round: this.round,
@@ -419,6 +457,7 @@ export class ActivationBroker<
     this.recordPhoneAttemptOutcome(activation.phoneNumber, activation.activationId, outcome);
     this.history.totalWithdrawnActivations += 1;
     this.recordPhoneRelease(activation.phoneNumber, "withdraw");
+    this.recordActivationCostRelease(activation.activationId, "refunded");
     console.log(
       `[pollSMSCode] provider 已释放 activation，丢弃本地状态 phone=+${activation.phoneNumber} outcome=${outcome}`,
     );
@@ -466,6 +505,32 @@ export class ActivationBroker<
     stats.lastUsedAt = now;
   }
 
+  private recordActivationCost(activation: Activation): void {
+    const activationId = String(activation.activationId ?? "").trim();
+    if (!activationId || this.activationCosts.has(activationId)) return;
+    const cost = normalizeCost(activation.activationCost);
+    const now = new Date();
+    this.activationCosts.set(activationId, {
+      activationId,
+      phoneNumber: String(activation.phoneNumber ?? "").trim(),
+      cost,
+      refundCost: 0,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  private recordActivationCostRelease(activationId: string, status: ActivationCostStatus): void {
+    const normalizedActivationId = String(activationId ?? "").trim();
+    if (!normalizedActivationId) return;
+    const entry = this.activationCosts.get(normalizedActivationId);
+    if (!entry) return;
+    entry.status = status;
+    entry.refundCost = status === "refunded" ? entry.cost : 0;
+    entry.updatedAt = new Date();
+  }
+
   private recordPhoneAttemptStart(phoneNumber: string, activationId: string): void {
     const stats = this.getPhoneStats(phoneNumber);
     const now = new Date();
@@ -509,4 +574,13 @@ export class ActivationBroker<
     stats.firstUsedAt ??= now;
     stats.lastUsedAt = now;
   }
+}
+
+function normalizeCost(value: unknown): number {
+  const cost = Number(value);
+  return Number.isFinite(cost) && cost > 0 ? roundCost(cost) : 0;
+}
+
+function roundCost(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }

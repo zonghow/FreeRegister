@@ -10,6 +10,8 @@ async function adminSource(): Promise<string> {
 test("sms config UI hides advanced HeroSMS fields", async () => {
     const source = await adminSource();
 
+    assert.match(source, /id="successCostMeta"/);
+    assert.match(source, /#successCostMeta\s*\{[^}]*white-space:\s*pre-line/);
     assert.match(source, /id="smsApiKeyStrategy"/);
     assert.doesNotMatch(source, /id="smsApiKey"/);
     assert.doesNotMatch(source, /id="smsProxyUrls"/);

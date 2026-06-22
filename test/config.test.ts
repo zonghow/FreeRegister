@@ -85,6 +85,12 @@ urls = ["socks5://one", "socks5://two"]
 [cpa_json]
 dir = "custom-cpa"
 
+[cost]
+email_unit_cost = 0.07
+currency = "USD"
+success_ledger = "costs/custom-success.jsonl"
+lock = "costs/custom.lock"
+
 [sentinel_sdk]
 url = "https://example.com/sdk.js"
 file = "custom-sdk.js"
@@ -126,6 +132,10 @@ file = "custom-sdk.js"
         assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "proxies"}}, 1), "socks5://two");
         assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "direct"}}, 0), "");
         assert.equal(overridden.cpaJson.dir, path.join(dir, "custom-cpa"));
+        assert.equal(overridden.cost.emailUnitCost, 0.07);
+        assert.equal(overridden.cost.currency, "USD");
+        assert.equal(overridden.cost.successLedger, path.join(dir, "costs/custom-success.jsonl"));
+        assert.equal(overridden.cost.lock, path.join(dir, "costs/custom.lock"));
         assert.equal(overridden.sentinelSdk.url, "https://example.com/sdk.js");
         assert.equal(overridden.sentinelSdk.file, "custom-sdk.js");
     } finally {

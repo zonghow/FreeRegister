@@ -35,6 +35,7 @@ type HeroSMSBrokerOption = {
   baseUrl?: string;
   timeoutMs?: number;
   rateLimitWindowMs?: number;
+  cancelAndWithdrawMinAgeMs?: number;
 }
 
 interface AcquireCandidate {
@@ -178,6 +179,7 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
       proxyUrl: option.proxyUrl,
       baseUrl: option.baseUrl,
       timeoutMs: option.timeoutMs,
+      cancelAndWithdrawMinAgeMs: option.cancelAndWithdrawMinAgeMs,
       rpsLimit,
       rateLimitWindowMs,
       rateLimitLabel: `Key #${index + 1} ${redactHeroSmsKey(apiKey)}`,

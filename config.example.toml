@@ -56,6 +56,13 @@ lock = ".email.lock"
 [cpa_json]
 dir = "cpa_json"
 
+# 成功账号成本统计。每个成功账号会追加一行 JSONL 流水。
+[cost]
+email_unit_cost = 0.05
+currency = "USD"
+success_ledger = "cost.success.jsonl"
+lock = ".cost.lock"
+
 # 代理池。多个代理会按 worker 轮询负载均衡。
 [proxies]
 urls = []

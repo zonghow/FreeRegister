@@ -3,6 +3,7 @@ export interface SmsActivation {
   phoneNumber: string;
   expiresAt?: Date;
   canRequestAnotherSms?: boolean;
+  activationCost?: number;
 }
 
 export interface SmsVerificationCode {

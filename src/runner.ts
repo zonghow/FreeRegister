@@ -1,6 +1,7 @@
 import {getHeapStatistics} from "node:v8";
 import {heroSmsProxyForWorker, proxyForWorker, redactProxy, type AppConfig} from "./config.js";
 import {EmailPool, type EmailLease} from "./email-pool.js";
+import {appendSuccessCostRecord} from "./cost.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
 import {OpenAIClient} from "./openai.js";
@@ -228,7 +229,7 @@ async function phoneSignup(
     logger: RegisterLogger,
     signal?: AbortSignal,
     updateWorker?: WorkerUpdate,
-): Promise<{phone: string}> {
+): Promise<{phone: string; smsCost: number; smsGrossCost: number; smsRefundCost: number}> {
     const smsBroker = createBroker(config, heroSmsProxyForWorker(config, workerId - 1));
     let lastErr: unknown = null;
 
@@ -293,7 +294,13 @@ async function phoneSignup(
                 latestLog: `手机注册成功 ${phoneNumber}`,
             });
             logger.info(`[worker-${workerId}] [phone] 注册成功 ${phoneNumber}`);
-            return {phone: phoneNumber};
+            const cost = smsBroker.getCostSummary();
+            return {
+                phone: phoneNumber,
+                smsCost: cost.netCost,
+                smsGrossCost: cost.grossCost,
+                smsRefundCost: cost.refundCost,
+            };
         } catch (error) {
             if (signal?.aborted) {
                 try {
@@ -461,9 +468,15 @@ export async function runOne(
     logger.info(`[worker-${workerId}] [email] 已租约 ${emailLease.email}`);
 
     let phone = "";
+    let smsCost = 0;
+    let smsGrossCost = 0;
+    let smsRefundCost = 0;
     try {
         const signup = await phoneSignup(config, proxyUrl, workerId, logger, signal, updateWorker);
         phone = signup.phone;
+        smsCost = signup.smsCost;
+        smsGrossCost = signup.smsGrossCost;
+        smsRefundCost = signup.smsRefundCost;
     } catch (error) {
         if (signal?.aborted) {
             updateWorker?.({
@@ -491,6 +504,20 @@ export async function runOne(
     try {
         await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal, updateWorker);
         await pool.markSuccess(emailLease);
+        try {
+            const costRecord = await appendSuccessCostRecord(config.cost, {
+                email: emailLease.email,
+                phone,
+                emailCost: config.cost.emailUnitCost,
+                smsCost,
+                smsGrossCost,
+                smsRefundCost,
+                currency: config.cost.currency,
+            });
+            logger.info(`[worker-${workerId}] [cost] email=${emailLease.email} sms_gross=${costRecord.smsGrossCost} sms_refund=${costRecord.smsRefundCost} sms=${costRecord.smsCost} email_cost=${costRecord.emailCost} total=${costRecord.totalCost} ${costRecord.currency}`);
+        } catch (costError) {
+            logger.warn(`[worker-${workerId}] [cost] 成本流水写入失败，不影响成功结果: ${(costError as Error).message}`);
+        }
         updateWorker?.({
             status: "success",
             stage: "success",

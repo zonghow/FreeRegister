@@ -3,6 +3,7 @@ import {createServer, type IncomingMessage, type ServerResponse} from "node:http
 import {mkdir, readFile, readdir, rename, stat, writeFile} from "node:fs/promises";
 import path from "node:path";
 import JSZip from "jszip";
+import {removeSuccessCostRecords, successCostLinesForEmails, summarizeSuccessCosts} from "./cost.js";
 import {EmailPool, emailFromLine} from "./email-pool.js";
 import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
@@ -486,6 +487,7 @@ function publicConfigSummary(config: AppConfig): JsonValue {
         proxies: config.proxies.map(redactProxy),
         emailPool: config.emailPool as unknown as JsonValue,
         cpaJson: config.cpaJson as unknown as JsonValue,
+        cost: config.cost as unknown as JsonValue,
         sentinelSdk: config.sentinelSdk as unknown as JsonValue,
     };
 }
@@ -806,7 +808,7 @@ async function collectCpaJsonFiles(cpaJsonDir: string, emails: string[]): Promis
     return matches;
 }
 
-async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string): Promise<{buffer: Buffer; matched: number; missing: string[]}> {
+async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string, costLines: string[] = []): Promise<{buffer: Buffer; matched: number; missing: string[]}> {
     const zip = new JSZip();
     const successContent = successLines.length ? `${successLines.join("\n")}\n` : "";
     const emails = successLines.map(emailFromLine).filter(Boolean);
@@ -825,6 +827,9 @@ async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string)
 
     if (missing.length) {
         zip.file("cpa_json_missing.txt", `${missing.join("\n")}\n`);
+    }
+    if (costLines.length) {
+        zip.file("cost.success.jsonl", `${costLines.join("\n")}\n`);
     }
 
     const buffer = await zip.generateAsync({
@@ -850,10 +855,13 @@ async function currentStatus(options: {refreshBalance?: boolean} = {}): Promise<
     try {
         const config = loadConfig();
         const pool = new EmailPool(config.emailPool);
+        const poolStats = await pool.stats();
+        const successLines = await pool.successLines();
         return {
             ok: true,
             runner: runner.getSnapshot() as unknown as JsonValue,
-            pool: await pool.stats() as unknown as JsonValue,
+            pool: poolStats as unknown as JsonValue,
+            successCost: await summarizeSuccessCosts(config.cost, successLines) as unknown as JsonValue,
             heroSmsBalance: await heroSmsBalanceStatus(config, {forceRefresh: options.refreshBalance}),
             heroSmsRps: heroSmsRpsStatus(config),
             configPath: configPath(),
@@ -1007,10 +1015,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const config = loadConfig();
         const pool = new EmailPool(config.emailPool);
         const successLines = await pool.successLines();
-        const {buffer, matched, missing} = await buildSuccessExportZip(successLines, config.cpaJson.dir);
-        await pool.clearSuccessEmails(successLines.map(emailFromLine));
+        const successEmails = successLines.map(emailFromLine).filter(Boolean);
+        const costLines = await successCostLinesForEmails(config.cost, successEmails);
+        const {buffer, matched, missing} = await buildSuccessExportZip(successLines, config.cpaJson.dir, costLines);
+        await pool.clearSuccessEmails(successEmails);
+        let removedCostRecords = 0;
+        try {
+            removedCostRecords = (await removeSuccessCostRecords(config.cost, successEmails)).removed;
+        } catch (costError) {
+            logger.warn(`[admin] 成功邮箱已导出，但成本流水清理失败: ${(costError as Error).message}`);
+        }
         const filename = `free-register-success.${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
-        logger.info(`[admin] 导出并清空成功邮箱 emails=${successLines.length} cpa_json=${matched} missing=${missing.length} bytes=${buffer.length}`);
+        logger.info(`[admin] 导出并清空成功邮箱 emails=${successLines.length} cpa_json=${matched} missing=${missing.length} cost_records=${removedCostRecords} bytes=${buffer.length}`);
         send(res, 200, buffer, {
             "content-type": "application/zip",
             "content-disposition": `attachment; filename="${filename}"`,
@@ -1087,6 +1103,7 @@ function html(): string {
     .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #successCostMeta { white-space: pre-line; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
     #heroSmsBalanceMeta { white-space: normal; overflow-wrap: anywhere; }
     .sms-rps-list { display: grid; gap: 2px; max-height: 74px; overflow: auto; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.25; }
     .sms-rps-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; white-space: nowrap; }
@@ -1185,7 +1202,7 @@ function html(): string {
     <main>
       <section class="grid">
         <div class="panel metric">待使用<strong id="countSource">0</strong></div>
-        <div class="panel metric">成功<strong id="countSuccess">0</strong></div>
+        <div class="panel metric">成功<strong id="countSuccess">0</strong><span id="successCostMeta" class="sub"></span></div>
         <div class="panel metric"><span>进行中</span><strong id="countInflight">0</strong><div class="metric-actions"><button id="returnInflightBtn" type="button" class="secondary">归还</button><button id="failInflightBtn" type="button" class="secondary">标失败</button></div></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
@@ -1497,6 +1514,13 @@ function html(): string {
       return amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
     }
 
+    function formatCostAmount(value, currency) {
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return "-";
+      const formatted = amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+      return (currency ? String(currency) + " " : "") + formatted;
+    }
+
     function formatRpsAmount(value) {
       const amount = Number(value);
       if (!Number.isFinite(amount)) return "0";
@@ -1576,6 +1600,20 @@ function html(): string {
         fragment.appendChild(row);
       }
       list.appendChild(fragment);
+    }
+
+    function updateSuccessCost(cost) {
+      if (!cost || Number(cost.count || 0) <= 0) {
+        setText("successCostMeta", "");
+        return;
+      }
+      const lines = [
+        "总 " + formatCostAmount(cost.total, cost.currency),
+        "均 " + formatCostAmount(cost.average, cost.currency)
+      ];
+      const estimated = Number(cost.estimatedCount || 0);
+      if (estimated > 0) lines.push(estimated + " 估算");
+      setText("successCostMeta", lines.join("\\n"));
     }
 
     function countryLabel(id) {
@@ -1730,6 +1768,7 @@ function html(): string {
       state.runnerBusy = runner.status === "running" || runner.status === "pausing" || runner.status === "force_pausing" || Number(runner.activeWorkers || 0) > 0;
       setText("countSource", pool.source || 0);
       setText("countSuccess", pool.success || 0);
+      updateSuccessCost(data.successCost);
       setText("countInflight", state.inflightCount);
       setText("countFailed", pool.failed || 0);
       updateInflightButtons();

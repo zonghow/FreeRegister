@@ -56,12 +56,20 @@ export interface CpaJsonConfig {
     dir: string;
 }
 
+export interface CostConfig {
+    emailUnitCost: number;
+    currency: string;
+    successLedger: string;
+    lock: string;
+}
+
 export interface AppConfig {
     run: RunConfig;
     openai: OpenAIConfig;
     heroSMS: HeroSMSConfig;
     emailPool: EmailPoolConfig;
     cpaJson: CpaJsonConfig;
+    cost: CostConfig;
     proxies: string[];
     sentinelBrowser: SentinelBrowserConfig;
     sentinelSdk: SentinelSdkConfig;
@@ -114,6 +122,12 @@ const DEFAULT_CONFIG: AppConfig = {
     },
     cpaJson: {
         dir: "cpa_json",
+    },
+    cost: {
+        emailUnitCost: 0.05,
+        currency: "USD",
+        successLedger: "cost.success.jsonl",
+        lock: ".cost.lock",
     },
     proxies: [],
     sentinelBrowser: {
@@ -264,6 +278,10 @@ function positiveNumber(value: number, fallback: number): number {
     return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function nonNegativeNumber(value: number, fallback: number): number {
+    return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function positiveInteger(value: number, fallback: number): number {
     return Number.isInteger(value) && value > 0 ? value : fallback;
 }
@@ -362,6 +380,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
             ...config.cpaJson,
             dir: cpaJsonDir ? path.resolve(cpaJsonDir) : config.cpaJson.dir,
         },
+        cost: config.cost,
         sentinelSdk: {
             ...config.sentinelSdk,
             url: sentinelSdkUrl || config.sentinelSdk.url,
@@ -393,6 +412,7 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
     const hero = parsed.hero_sms ?? {};
     const emailPool = parsed.email_pool ?? {};
     const cpaJson = parsed.cpa_json ?? {};
+    const cost = parsed.cost ?? {};
     const proxies = parsed.proxies ?? {};
     const sentinelBrowser = parsed.sentinel_browser ?? {};
     const sentinelSdk = parsed.sentinel_sdk ?? {};
@@ -454,6 +474,12 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
         },
         cpaJson: {
             dir: pathValue(cpaJson.dir, DEFAULT_CONFIG.cpaJson.dir, configDir),
+        },
+        cost: {
+            emailUnitCost: nonNegativeNumber(numberValue(cost.email_unit_cost, DEFAULT_CONFIG.cost.emailUnitCost), DEFAULT_CONFIG.cost.emailUnitCost),
+            currency: stringValue(cost.currency, DEFAULT_CONFIG.cost.currency) || DEFAULT_CONFIG.cost.currency,
+            successLedger: pathValue(cost.success_ledger, DEFAULT_CONFIG.cost.successLedger, configDir),
+            lock: pathValue(cost.lock, DEFAULT_CONFIG.cost.lock, configDir),
         },
         proxies: proxyUrls,
         sentinelBrowser: {

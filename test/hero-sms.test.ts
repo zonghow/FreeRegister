@@ -496,6 +496,134 @@ test("shares one HeroSMS account RPS window across getNumber and setStatus", asy
   }
 });
 
+test("tracks HeroSMS gross and refunded activation costs", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const statuses: string[] = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+
+    if (action === "getNumberV2") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "cost-activation", phoneNumber: "573580000001", activationCost: 0.45}));
+      return;
+    }
+
+    if (action === "setStatus") {
+      statuses.push(url.searchParams.get("status") ?? "");
+      res.end("ACCESS_CANCEL");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const broker = createSMSBroker({
+    apiKeys: ["key-a"],
+    apiKeyStrategy: "round_robin",
+    rpsLimit: 100,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+    countries: [33],
+    acquirePriority: "country",
+    minPrice: 0.01,
+    maxPrice: 0.01,
+    priceStep: 0.01,
+    pollIntervalMs: 1,
+    autoReleaseOnTimeout: false,
+  });
+
+  try {
+    const lease = await broker.getActivation();
+    assert.equal(lease.activationCost, 0.45);
+    const beforeCancel = broker.getCostSummary();
+    assert.equal(beforeCancel.grossCost, 0.45);
+    assert.equal(beforeCancel.refundCost, 0);
+    assert.equal(beforeCancel.netCost, 0.45);
+    assert.equal(beforeCancel.activations[0]?.status, "active");
+
+    await broker.cancelCurrentActivation();
+    const summary = broker.getCostSummary();
+    assert.deepEqual(statuses, ["8"]);
+    assert.equal(summary.grossCost, 0.45);
+    assert.equal(summary.refundCost, 0.45);
+    assert.equal(summary.netCost, 0);
+    assert.equal(summary.activations[0]?.status, "refunded");
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("tracks provider auto release as refunded activation cost", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+
+    if (action === "getNumberV2") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "auto-release-cost", phoneNumber: "573580000002", activationCost: 0.33}));
+      return;
+    }
+
+    if (action === "getActiveActivations") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({status: "success", data: []}));
+      return;
+    }
+
+    if (action === "getStatusV2" || action === "getStatus") {
+      res.end("STATUS_WAIT_CODE");
+      return;
+    }
+
+    if (action === "setStatus") {
+      res.end("ACCESS_CANCEL");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const broker = createSMSBroker({
+    apiKeys: ["key-a"],
+    apiKeyStrategy: "round_robin",
+    rpsLimit: 100,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+    countries: [33],
+    acquirePriority: "country",
+    minPrice: 0.01,
+    maxPrice: 0.01,
+    priceStep: 0.01,
+    pollIntervalMs: 1,
+    autoReleaseOnTimeout: true,
+    cancelAndWithdrawMinAgeMs: 0,
+  });
+
+  try {
+    const lease = await broker.getActivation();
+    await assert.rejects(
+      lease.waitForVerificationCode(),
+      (error) => error instanceof HeroSmsActivationReleasedError,
+    );
+
+    const summary = broker.getCostSummary();
+    assert.equal(summary.grossCost, 0.33);
+    assert.equal(summary.refundCost, 0.33);
+    assert.equal(summary.netCost, 0);
+    assert.equal(summary.activations[0]?.status, "refunded");
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("uses the bound HeroSMS key for activation status and release", async () => {
   resetHeroSmsRpsStatsForTest();
   const calls: Array<{action: string; apiKey: string}> = [];
