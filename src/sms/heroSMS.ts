@@ -231,13 +231,27 @@ async function heroSmsFetch(
   config: HeroSmsProviderConfig,
   input: string | URL,
   init: UndiciRequestInit = {},
-) {
+): Promise<{ok: boolean; status: number; payload: unknown}> {
   const timeoutMs = Number(config.timeoutMs ?? 0);
-  return undiciFetch(input, {
-    ...init,
-    signal: init.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined),
-    dispatcher: buildDispatcher(config),
-  } satisfies UndiciRequestInit);
+  const dispatcher = buildDispatcher(config);
+  try {
+    const response = await undiciFetch(input, {
+      ...init,
+      signal: init.signal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined),
+      dispatcher,
+    } satisfies UndiciRequestInit);
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload: await readResponseBody(response),
+    };
+  } finally {
+    try {
+      await dispatcher.close();
+    } catch {
+      // Dispatcher cleanup should never mask the API result.
+    }
+  }
 }
 
 function normalizeListValue(value?: string | string[]): string | undefined {
@@ -485,7 +499,7 @@ async function requestHeroSmsCountriesApi(
       Accept: "application/json, text/plain;q=0.9, */*;q=0.8",
     },
   });
-  const payload = await readResponseBody(response);
+  const payload = response.payload;
 
   if (!response.ok) {
     throw createApiError("getCountries", payload, response.status);
@@ -517,8 +531,7 @@ async function requestHeroSmsApi(
       Accept: "application/json, text/plain;q=0.9, */*;q=0.8",
     },
   });
-
-  const payload = await readResponseBody(response);
+  const payload = response.payload;
 
   if (!response.ok) {
     throw createApiError(action, payload, response.status);

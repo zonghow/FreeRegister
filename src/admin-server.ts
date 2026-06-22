@@ -139,6 +139,9 @@ class LogBuffer implements RegisterLogger {
     }
 
     private queueBroadcast(entry: LogEntry): void {
+        if (!this.subscribers.size) {
+            return;
+        }
         this.pendingBroadcasts.push(entry);
         if (this.pendingBroadcasts.length >= MAX_LOG_BROADCAST_BATCH) {
             this.flushBroadcasts();
@@ -990,7 +993,7 @@ function html(): string {
     header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); background: rgba(247,247,245,.9); position: sticky; top: 0; backdrop-filter: blur(12px); }
     h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
     main { width: min(1280px, calc(100vw - 24px)); max-width: calc(100vw - 24px); min-width: 0; margin: 12px auto 28px; display: grid; gap: 10px; }
-    .grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
     .panel { min-width: 0; max-width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
     .panel h2 { margin: 0; font-size: 13px; font-weight: 650; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -1092,6 +1095,7 @@ function html(): string {
         <div class="panel metric">成功<strong id="countSuccess">0</strong></div>
         <div class="panel metric"><span>进行中</span><strong id="countInflight">0</strong><div class="metric-actions"><button id="returnInflightBtn" type="button" class="secondary">归还</button><button id="failInflightBtn" type="button" class="secondary">标失败</button></div></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
+        <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
         <div class="panel metric"><div class="metric-head"><span>HeroSMS 余额</span><button id="refreshHeroSmsBalanceBtn" type="button" class="icon-button" title="刷新余额" aria-label="刷新余额"><span aria-hidden="true">&#8635;</span></button></div><strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
       </section>
 
@@ -1294,6 +1298,21 @@ function html(): string {
       if (minutes < 60) return minutes + "m" + String(rest).padStart(2, "0") + "s";
       const hours = Math.floor(minutes / 60);
       return hours + "h" + String(minutes % 60).padStart(2, "0") + "m";
+    }
+
+    function updateMemory(memory) {
+      if (!memory || typeof memory !== "object") {
+        setText("memoryUsed", "-");
+        setText("memoryMeta", "");
+        return;
+      }
+      const used = Number(memory.guardUsedMb || 0);
+      const hard = Number(memory.hardLimitMb || 0);
+      const heap = Number(memory.heapUsedMb || 0);
+      const heapLimit = Number(memory.heapLimitMb || 0);
+      const level = memory.level && memory.level !== "ok" ? " · " + memory.level : "";
+      setText("memoryUsed", used && hard ? used + " / " + hard + " MB" : (used ? used + " MB" : "-"));
+      setText("memoryMeta", "heap " + (heap || "-") + " / " + (heapLimit || "-") + " MB" + level);
     }
 
     function appendCell(row, value, className) {
@@ -1563,6 +1582,7 @@ function html(): string {
       updateInflightButtons();
       updateHeroSmsBalance(data.heroSmsBalance);
       setText("runnerStatus", runner.status || "idle");
+      updateMemory(runner.memory);
       renderWorkers(runner.workers || []);
       if (data.configPath) setText("configPath", data.configPath);
       if (data.effectiveConfig && data.effectiveConfig.run) {
@@ -1655,7 +1675,12 @@ function html(): string {
       $("toggleLogsBtn").textContent = state.logsExpanded ? "折叠" : "展开";
       $("toggleLogsBtn").setAttribute("aria-expanded", String(state.logsExpanded));
       setText("logsState", state.logsExpanded ? "实时" : "已折叠" + (state.logLines.length ? " · " + state.logLines.length + " 行" : ""));
-      if (state.logsExpanded) renderLogBox();
+      if (state.logsExpanded) {
+        renderLogBox();
+        connectLogStream();
+      } else {
+        closeLogStream();
+      }
     }
 
     function flushLogs() {
@@ -1691,7 +1716,7 @@ function html(): string {
     }
 
     function connectLogStream() {
-      if (!state.authed || state.logSource) return;
+      if (!state.authed || !state.logsExpanded || state.logSource) return;
       const source = new EventSource("/api/logs/stream");
       state.logSource = source;
       source.addEventListener("log", (event) => {
@@ -1729,7 +1754,6 @@ function html(): string {
         setText("loginMsg", "");
         state.authed = true;
         showApp();
-        connectLogStream();
         await Promise.all([refreshStatus(), loadConfig(), loadSmsConfig()]);
       } catch (error) {
         setText("loginMsg", error.message);

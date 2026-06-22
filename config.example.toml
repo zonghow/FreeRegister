@@ -5,6 +5,9 @@ total = 1
 concurrency = 1
 use_browser_sentinel = false
 run_until_empty = false
+# 0 表示按当前 Node heap 自动计算；达到软阈值会停止派发新任务，达到硬阈值会强制暂停。
+memory_soft_limit_mb = 0
+memory_hard_limit_mb = 0
 
 # OpenAI / Codex 登录配置。
 # CPA JSON 现在固定保存在 [cpa_json].dir；save_auth_json 只控制额外 auth/ 目录保存。

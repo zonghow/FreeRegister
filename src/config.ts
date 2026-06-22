@@ -8,6 +8,8 @@ export interface RunConfig {
     maxPhoneTries: number;
     useBrowserSentinel: boolean;
     runUntilEmpty: boolean;
+    memorySoftLimitMb: number;
+    memoryHardLimitMb: number;
 }
 
 export interface OpenAIConfig {
@@ -71,6 +73,8 @@ const DEFAULT_CONFIG: AppConfig = {
         maxPhoneTries: 20,
         useBrowserSentinel: false,
         runUntilEmpty: false,
+        memorySoftLimitMb: 0,
+        memoryHardLimitMb: 0,
     },
     openai: {
         defaultPassword: "change-this-password",
@@ -382,6 +386,8 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
             maxPhoneTries: runMaxPhoneTries,
             useBrowserSentinel: booleanValue(run.use_browser_sentinel, DEFAULT_CONFIG.run.useBrowserSentinel),
             runUntilEmpty: booleanValue(run.run_until_empty, DEFAULT_CONFIG.run.runUntilEmpty),
+            memorySoftLimitMb: Math.max(0, Math.floor(numberValue(run.memory_soft_limit_mb, DEFAULT_CONFIG.run.memorySoftLimitMb))),
+            memoryHardLimitMb: Math.max(0, Math.floor(numberValue(run.memory_hard_limit_mb, DEFAULT_CONFIG.run.memoryHardLimitMb))),
         },
         openai: openAIConfig,
         heroSMS: {

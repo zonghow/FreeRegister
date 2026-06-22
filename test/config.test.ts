@@ -45,6 +45,8 @@ total = 2
 concurrency = 1
 max_phone_tries = 7
 run_until_empty = false
+memory_soft_limit_mb = 7000
+memory_hard_limit_mb = 8000
 
 [openai]
 default_password = "pw"
@@ -80,6 +82,8 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.total, 5);
         assert.equal(overridden.run.concurrency, 3);
         assert.equal(overridden.run.maxPhoneTries, 7);
+        assert.equal(overridden.run.memorySoftLimitMb, 7000);
+        assert.equal(overridden.run.memoryHardLimitMb, 8000);
         assert.deepEqual(overridden.heroSMS.countries, [33, 52]);
         assert.equal(overridden.heroSMS.acquirePriority, "price_low");
         assert.equal(overridden.heroSMS.minPrice, 0.04);

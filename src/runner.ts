@@ -1,3 +1,4 @@
+import {getHeapStatistics} from "node:v8";
 import {proxyForWorker, redactProxy, type AppConfig} from "./config.js";
 import {EmailPool, type EmailLease} from "./email-pool.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
@@ -49,6 +50,22 @@ export interface WorkerSnapshot {
     error: string;
 }
 
+export type MemoryGuardLevel = "ok" | "soft" | "hard";
+
+export interface RuntimeMemorySnapshot {
+    rssMb: number;
+    heapUsedMb: number;
+    heapTotalMb: number;
+    heapLimitMb: number;
+    externalMb: number;
+    arrayBuffersMb: number;
+    guardUsedMb: number;
+    softLimitMb: number;
+    hardLimitMb: number;
+    level: MemoryGuardLevel;
+    checkedAt: string;
+}
+
 export interface RunnerSnapshot {
     status: RunnerStatus;
     total: number;
@@ -62,6 +79,7 @@ export interface RunnerSnapshot {
     startedAt: string;
     endedAt: string;
     lastError: string;
+    memory: RuntimeMemorySnapshot;
     workers: WorkerSnapshot[];
 }
 
@@ -72,6 +90,46 @@ const DEFAULT_LOGGER: RegisterLogger = {
 };
 
 const FORCE_PAUSE_MESSAGE = "任务已被强制暂停";
+const MEMORY_MONITOR_INTERVAL_MS = 5000;
+const AUTO_MEMORY_SOFT_RATIO = 0.82;
+const AUTO_MEMORY_HARD_RATIO = 0.9;
+const MB = 1024 * 1024;
+
+function bytesToMb(bytes: number): number {
+    return Math.round(bytes / MB);
+}
+
+function runtimeMemorySnapshot(config?: AppConfig): RuntimeMemorySnapshot {
+    const usage = process.memoryUsage();
+    const heapLimitMb = bytesToMb(getHeapStatistics().heap_size_limit);
+    const autoSoftLimitMb = Math.max(256, Math.floor(heapLimitMb * AUTO_MEMORY_SOFT_RATIO));
+    const autoHardLimitMb = Math.max(autoSoftLimitMb + 1, Math.floor(heapLimitMb * AUTO_MEMORY_HARD_RATIO));
+    const configuredHardLimitMb = Math.floor(config?.run.memoryHardLimitMb ?? 0);
+    const hardLimitMb = configuredHardLimitMb > 0 ? configuredHardLimitMb : autoHardLimitMb;
+    const configuredSoftLimitMb = Math.floor(config?.run.memorySoftLimitMb ?? 0);
+    const softLimitMb = configuredSoftLimitMb > 0
+        ? Math.min(configuredSoftLimitMb, Math.max(1, hardLimitMb - 1))
+        : Math.min(autoSoftLimitMb, Math.max(1, hardLimitMb - 1));
+    const rssMb = bytesToMb(usage.rss);
+    const heapUsedMb = bytesToMb(usage.heapUsed);
+    const guardUsedMb = Math.max(rssMb, heapUsedMb);
+    const level: MemoryGuardLevel = guardUsedMb >= hardLimitMb
+        ? "hard"
+        : (guardUsedMb >= softLimitMb ? "soft" : "ok");
+    return {
+        rssMb,
+        heapUsedMb,
+        heapTotalMb: bytesToMb(usage.heapTotal),
+        heapLimitMb,
+        externalMb: bytesToMb(usage.external),
+        arrayBuffersMb: bytesToMb(usage.arrayBuffers),
+        guardUsedMb,
+        softLimitMb,
+        hardLimitMb,
+        level,
+        checkedAt: new Date().toISOString(),
+    };
+}
 
 function createForcePauseError(): Error {
     const error = new Error(FORCE_PAUSE_MESSAGE);
@@ -103,6 +161,7 @@ function emptySnapshot(): RunnerSnapshot {
         startedAt: "",
         endedAt: "",
         lastError: "",
+        memory: runtimeMemorySnapshot(),
         workers: [],
     };
 }
@@ -254,6 +313,12 @@ async function phoneSignup(
             } catch {
                 // 忽略接码平台回收失败，继续换号。
             }
+        } finally {
+            try {
+                await signupClient.close();
+            } catch (closeError) {
+                logger.warn(`[worker-${workerId}] [phone] OpenAI client 关闭失败: ${(closeError as Error).message}`);
+            }
         }
     }
 
@@ -327,16 +392,24 @@ async function bindEmailViaOAuth(
         phone,
         latestLog: "Codex OAuth 中",
     });
-    const authResult = await oauthClient.authLoginHTTP();
-    throwIfForcePaused(signal);
-    updateWorker?.({
-        status: "running",
-        stage: "oauth_exchange",
-        email: bindEmail,
-        phone,
-        latestLog: `OAuth 完成 cpa_json=${authResult.authFile || "not-saved"}`,
-    });
-    logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} cpa_json=${authResult.authFile || "not-saved"}`);
+    try {
+        const authResult = await oauthClient.authLoginHTTP();
+        throwIfForcePaused(signal);
+        updateWorker?.({
+            status: "running",
+            stage: "oauth_exchange",
+            email: bindEmail,
+            phone,
+            latestLog: `OAuth 完成 cpa_json=${authResult.authFile || "not-saved"}`,
+        });
+        logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} cpa_json=${authResult.authFile || "not-saved"}`);
+    } finally {
+        try {
+            await oauthClient.close();
+        } catch (closeError) {
+            logger.warn(`[worker-${workerId}] [oauth] OpenAI client 关闭失败: ${(closeError as Error).message}`);
+        }
+    }
 }
 
 export async function runOne(
@@ -463,6 +536,9 @@ export class RegisterTaskRunner {
     private forcePauseRequested = false;
     private abortController: AbortController | null = null;
     private promise: Promise<RunnerSnapshot> | null = null;
+    private memoryMonitor: ReturnType<typeof setInterval> | null = null;
+    private memoryGuardLevel: MemoryGuardLevel = "ok";
+    private memoryConfig: AppConfig | null = null;
 
     constructor(private readonly logger: RegisterLogger = DEFAULT_LOGGER) {}
 
@@ -477,6 +553,8 @@ export class RegisterTaskRunner {
             : Math.min(config.run.concurrency, total);
         this.pauseRequested = false;
         this.forcePauseRequested = false;
+        this.memoryGuardLevel = "ok";
+        this.memoryConfig = config;
         this.abortController = new AbortController();
         this.snapshot = {
             ...emptySnapshot(),
@@ -485,9 +563,11 @@ export class RegisterTaskRunner {
             concurrency,
             runUntilEmpty: config.run.runUntilEmpty,
             startedAt: new Date().toISOString(),
+            memory: runtimeMemorySnapshot(config),
             workers: Array.from({length: concurrency}, (_, index) => emptyWorkerSnapshot(index + 1)),
         };
 
+        this.startMemoryMonitor(config);
         this.promise = this.run(config)
             .catch((error) => {
                 this.snapshot.status = "failed";
@@ -496,6 +576,8 @@ export class RegisterTaskRunner {
                 return this.snapshot;
             })
             .finally(() => {
+                this.stopMemoryMonitor();
+                this.snapshot.memory = runtimeMemorySnapshot(config);
                 this.snapshot.endedAt = new Date().toISOString();
                 this.snapshot.activeWorkers = 0;
                 for (const worker of this.snapshot.workers) {
@@ -537,10 +619,56 @@ export class RegisterTaskRunner {
     }
 
     getSnapshot(): RunnerSnapshot {
+        this.snapshot.memory = runtimeMemorySnapshot(this.memoryConfig ?? undefined);
         return {
             ...this.snapshot,
             workers: this.snapshot.workers.map(withElapsed),
         };
+    }
+
+    private startMemoryMonitor(config: AppConfig): void {
+        this.stopMemoryMonitor();
+        this.memoryMonitor = setInterval(() => {
+            this.checkMemoryGuard(config);
+        }, MEMORY_MONITOR_INTERVAL_MS);
+        this.memoryMonitor.unref?.();
+    }
+
+    private stopMemoryMonitor(): void {
+        if (!this.memoryMonitor) return;
+        clearInterval(this.memoryMonitor);
+        this.memoryMonitor = null;
+    }
+
+    private checkMemoryGuard(config: AppConfig): void {
+        const memory = runtimeMemorySnapshot(config);
+        this.snapshot.memory = memory;
+        if (memory.level === "ok") return;
+
+        if (memory.level === "hard" && this.memoryGuardLevel !== "hard") {
+            this.memoryGuardLevel = "hard";
+            this.pauseRequested = true;
+            this.forcePauseRequested = true;
+            if (this.snapshot.status === "running" || this.snapshot.status === "pausing") {
+                this.snapshot.status = "force_pausing";
+            }
+            this.logger.error(
+                `[FreeRegister] 内存达到硬阈值，强制暂停: used=${memory.guardUsedMb}MB rss=${memory.rssMb}MB heap=${memory.heapUsedMb}/${memory.heapLimitMb}MB limit=${memory.hardLimitMb}MB`,
+            );
+            this.abortController?.abort();
+            return;
+        }
+
+        if (memory.level === "soft" && this.memoryGuardLevel === "ok") {
+            this.memoryGuardLevel = "soft";
+            this.pauseRequested = true;
+            if (this.snapshot.status === "running") {
+                this.snapshot.status = "pausing";
+            }
+            this.logger.warn(
+                `[FreeRegister] 内存达到软阈值，停止派发新任务并等待当前任务结束: used=${memory.guardUsedMb}MB rss=${memory.rssMb}MB heap=${memory.heapUsedMb}/${memory.heapLimitMb}MB limit=${memory.softLimitMb}MB`,
+            );
+        }
     }
 
     private updateWorker(workerId: number, patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>): void {
@@ -560,6 +688,10 @@ export class RegisterTaskRunner {
         const mode = config.run.runUntilEmpty ? "until-empty" : "fixed-total";
         const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(this.snapshot.total);
         this.logger.info(`[FreeRegister] mode=${mode} total=${totalLabel} concurrency=${this.snapshot.concurrency} proxies=${config.proxies.length}`);
+        this.checkMemoryGuard(config);
+        this.logger.info(
+            `[FreeRegister] memory rss=${this.snapshot.memory.rssMb}MB heap=${this.snapshot.memory.heapUsedMb}/${this.snapshot.memory.heapLimitMb}MB soft=${this.snapshot.memory.softLimitMb}MB hard=${this.snapshot.memory.hardLimitMb}MB`,
+        );
 
         async function noop(): Promise<void> {}
 
@@ -575,6 +707,10 @@ export class RegisterTaskRunner {
                         latestLog: this.forcePauseRequested ? "强制暂停" : "暂停，不再派发新任务",
                     });
                     return;
+                }
+                this.checkMemoryGuard(config);
+                if (this.pauseRequested || this.forcePauseRequested) {
+                    continue;
                 }
                 const jobId = this.snapshot.nextJob;
                 if (!config.run.runUntilEmpty && jobId > this.snapshot.total) {

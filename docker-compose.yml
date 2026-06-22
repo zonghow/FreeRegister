@@ -13,8 +13,8 @@ services:
       FREE_REGISTER_CONFIG: /data/config.toml
       FREE_REGISTER_EMAIL_POOL_DIR: /data
       FREE_REGISTER_SENTINEL_SDK_FILE: /data/sdk.js
+      NODE_OPTIONS: "--max-old-space-size=${FREE_REGISTER_NODE_HEAP_MB:-12288}"
     ports:
       - "${FREE_REGISTER_ADMIN_PORT:-8788}:8788"
     volumes:
       - ./:/data
-    command: ["npm", "run", "admin", "--"]

@@ -281,6 +281,10 @@ export class OpenAIClient {
             this.fetchWithRetry(cookieFetch, input, init)) as FetchLike;
     }
 
+    async close(): Promise<void> {
+        await this.dispatcher.close();
+    }
+
     private logProgress(current: number | string, total: number, message: string): void {
         console.log(`[${current}/${total}] ${message}`);
     }

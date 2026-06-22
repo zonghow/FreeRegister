@@ -40,6 +40,12 @@ Run with Compose:
 docker compose run --rm free-register npm run register -- --total 2 --concurrency 2
 ```
 
+Compose 默认给后台进程设置 `NODE_OPTIONS=--max-old-space-size=12288`，降低长时间高并发撞到 Node 默认 4GB heap 的概率。可以按机器内存调整：
+
+```bash
+FREE_REGISTER_NODE_HEAP_MB=8192 docker compose up -d --build
+```
+
 To keep running until `email.txt` is empty, set this in `config.toml`:
 
 ```toml
@@ -49,6 +55,7 @@ run_until_empty = true
 ```
 
 When `run_until_empty = true`, `total` is ignored and workers stop only after no source email can be leased.
+The runner also monitors process memory. Leave `memory_soft_limit_mb` and `memory_hard_limit_mb` as `0` to derive thresholds from the current Node heap, or set explicit MB values in `[run]`.
 
 Update `sdk.js` from Docker:
 

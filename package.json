@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "admin": "tsx src/admin-server.ts",
+    "build": "tsc -p tsconfig.build.json",
     "register": "tsx src/index.ts",
+    "start:admin": "node dist/admin-server.js",
     "update:sdk": "tsx src/update-sdk.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --import tsx test/**/*.test.ts"

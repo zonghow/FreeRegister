@@ -78,9 +78,13 @@ npm run register -- --run-until-empty
 [run]
 concurrency = 10
 run_until_empty = true
+# 可选：0 表示按当前 Node heap 自动计算保护线。
+memory_soft_limit_mb = 0
+memory_hard_limit_mb = 0
 ```
 
 当 `run_until_empty = true` 时，`total` 会被忽略，任务会按指定并发一直运行到 `email.txt` 没有可租用邮箱。
+内存达到软阈值时会停止派发新任务，达到硬阈值时会强制暂停，避免长时间高并发直接触发 Node OOM。
 
 ## Web 后台
 
@@ -128,6 +132,7 @@ docker compose up --build -d
 ```
 
 Docker 运行时会把项目目录挂载到 `/data`，因此 `config.toml`、邮箱池和 `cpa_json/` 都保存在宿主机项目目录中。
+Compose 默认通过 `NODE_OPTIONS=--max-old-space-size=12288` 给 Node 12GB heap；可以用 `FREE_REGISTER_NODE_HEAP_MB=8192` 这类环境变量调整。
 
 更多 Docker 命令见 [DOCKER.md](./DOCKER.md)。
 
