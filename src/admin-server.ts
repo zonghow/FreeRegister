@@ -6,6 +6,7 @@ import JSZip from "jszip";
 import {EmailPool, emailFromLine} from "./email-pool.js";
 import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
+import {getHeroSmsRpsStats} from "./sms/index.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
 import {formatUtc8Timestamp} from "./utils.js";
 
@@ -467,6 +468,12 @@ function priorityFromBody(value: unknown, fallback: HeroSMSConfig["acquirePriori
     return fallback;
 }
 
+function apiKeyStrategyFromBody(value: unknown, fallback: HeroSMSConfig["apiKeyStrategy"]): HeroSMSConfig["apiKeyStrategy"] {
+    const normalized = String(value ?? "").trim();
+    if (normalized === "round_robin" || normalized === "fill_first") return normalized;
+    return fallback;
+}
+
 function proxyStrategyFromBody(value: unknown, fallback: HeroSMSProxyStrategy): HeroSMSProxyStrategy {
     const normalized = String(value ?? "").trim();
     if (normalized === "hero_sms" || normalized === "proxies" || normalized === "direct") return normalized;
@@ -817,6 +824,17 @@ async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string)
     return {buffer, matched: cpaFiles.size, missing};
 }
 
+function heroSmsRpsStatus(config: AppConfig): JsonValue {
+    const keys = getHeroSmsRpsStats(config.heroSMS.apiKeys, {rpsLimit: config.heroSMS.rpsLimit});
+    return {
+        ok: true,
+        keys: keys as unknown as JsonValue,
+        totalRps: Math.round(keys.reduce((sum, item) => sum + item.rps, 0) * 100) / 100,
+        totalLimit: keys.reduce((sum, item) => sum + item.rpsLimit, 0),
+        fetchedAt: new Date().toISOString(),
+    };
+}
+
 async function currentStatus(options: {refreshBalance?: boolean} = {}): Promise<JsonValue> {
     try {
         const config = loadConfig();
@@ -826,6 +844,7 @@ async function currentStatus(options: {refreshBalance?: boolean} = {}): Promise<
             runner: runner.getSnapshot() as unknown as JsonValue,
             pool: await pool.stats() as unknown as JsonValue,
             heroSmsBalance: await heroSmsBalanceStatus(config, {forceRefresh: options.refreshBalance}),
+            heroSmsRps: heroSmsRpsStatus(config),
             configPath: configPath(),
             effectiveConfig: publicConfigSummary(config),
         };
@@ -870,6 +889,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     if (pathname === "/api/status" && req.method === "GET") {
         const url = new URL(req.url ?? "/", "http://localhost");
         sendJson(res, 200, await currentStatus({refreshBalance: url.searchParams.get("refreshBalance") === "1"}));
+        return;
+    }
+
+    if (pathname === "/api/sms-rps" && req.method === "GET") {
+        const config = loadConfig();
+        sendJson(res, 200, {ok: true, heroSmsRps: heroSmsRpsStatus(config)});
         return;
     }
 
@@ -933,6 +958,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
         const values = {
             proxy_strategy: proxyStrategyFromBody(body.proxyStrategy, hero.proxyStrategy),
+            api_key_strategy: apiKeyStrategyFromBody(body.apiKeyStrategy, hero.apiKeyStrategy),
             countries: countriesFromBody(body.countries, hero.countries),
             acquire_priority: priorityFromBody(body.acquirePriority, hero.acquirePriority),
             min_price: Math.min(minPrice, maxPrice),
@@ -1042,7 +1068,7 @@ function html(): string {
     header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); background: rgba(247,247,245,.9); position: sticky; top: 0; backdrop-filter: blur(12px); }
     h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
     main { width: min(1280px, calc(100vw - 24px)); max-width: calc(100vw - 24px); min-width: 0; margin: 12px auto 28px; display: grid; gap: 10px; }
-    .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
     .panel { min-width: 0; max-width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
     .panel h2 { margin: 0; font-size: 13px; font-weight: 650; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -1051,6 +1077,10 @@ function html(): string {
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #heroSmsBalanceMeta { white-space: normal; overflow-wrap: anywhere; }
+    .sms-rps-list { display: grid; gap: 2px; max-height: 74px; overflow: auto; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.25; }
+    .sms-rps-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; white-space: nowrap; }
+    .sms-rps-item span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .sms-rps-item.disabled { color: var(--danger); }
     .metric-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
     .metric-actions button { height: 24px; padding: 0 7px; font-size: 11px; }
     .icon-button { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-color: var(--line); background: #fff; color: var(--text); line-height: 1; }
@@ -1149,6 +1179,7 @@ function html(): string {
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
         <div class="panel metric"><div class="metric-head"><span>HeroSMS 余额</span><button id="refreshHeroSmsBalanceBtn" type="button" class="icon-button" title="刷新余额" aria-label="刷新余额"><span aria-hidden="true">&#8635;</span></button></div><strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
+        <div class="panel metric"><span>HeroSMS RPS</span><strong id="heroSmsRpsTotal">0 / 0</strong><div id="heroSmsRpsList" class="sms-rps-list"></div></div>
       </section>
 
       <section class="panel stack">
@@ -1201,6 +1232,10 @@ function html(): string {
             <option value="hero_sms">专用代理</option>
             <option value="proxies">共用代理池</option>
             <option value="direct">不走代理</option>
+          </select></label>
+          <label><span>API Key 策略</span><select id="smsApiKeyStrategy">
+            <option value="round_robin">轮询</option>
+            <option value="fill_first">填充优先</option>
           </select></label>
           <label><span>取号策略</span><select id="smsAcquirePriority">
             <option value="country">国家优先</option>
@@ -1451,6 +1486,14 @@ function html(): string {
       return amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
     }
 
+    function formatRpsAmount(value) {
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return "0";
+      if (amount >= 100) return amount.toFixed(0);
+      if (amount >= 10) return amount.toFixed(1);
+      return amount.toFixed(2).replace(/\\.00$/, "");
+    }
+
     function formatUtc8Timestamp(value) {
       const parsed = value == null ? Date.now() : Date.parse(value || "");
       if (!Number.isFinite(parsed)) return "";
@@ -1494,6 +1537,33 @@ function html(): string {
       }
       setText("heroSmsBalance", "查询失败");
       setText("heroSmsBalanceMeta", String(balance.error || "").slice(0, 64));
+    }
+
+    function updateHeroSmsRps(status) {
+      const list = $("heroSmsRpsList");
+      list.textContent = "";
+      if (!status || !Array.isArray(status.keys) || status.keys.length === 0) {
+        setText("heroSmsRpsTotal", "0 / 0");
+        return;
+      }
+
+      const totalRps = Number(status.totalRps || 0);
+      const totalLimit = Number(status.totalLimit || 0);
+      setText("heroSmsRpsTotal", formatRpsAmount(totalRps) + " / " + (totalLimit || 0));
+      const fragment = document.createDocumentFragment();
+      for (const item of status.keys) {
+        const row = document.createElement("div");
+        row.className = "sms-rps-item" + (item.disabled ? " disabled" : "");
+        row.title = String(item.label || "Key") + " · " + String(item.windowCount || 0) + " req/" + String(item.windowMs || 1000) + "ms";
+        const label = document.createElement("span");
+        label.textContent = String(item.label || ("Key #" + item.index));
+        const value = document.createElement("span");
+        value.textContent = (item.disabled ? "停用 " : "") + formatRpsAmount(item.rps) + " / " + String(item.rpsLimit || 0);
+        row.appendChild(label);
+        row.appendChild(value);
+        fragment.appendChild(row);
+      }
+      list.appendChild(fragment);
     }
 
     function countryLabel(id) {
@@ -1592,6 +1662,7 @@ function html(): string {
 
     function fillSmsForm(hero) {
       $("smsProxyStrategy").value = normalizeSmsProxyStrategy(hero);
+      $("smsApiKeyStrategy").value = hero.apiKeyStrategy === "fill_first" ? "fill_first" : "round_robin";
       $("smsAcquirePriority").value = hero.acquirePriority || "country";
       setInputValue("smsMinPrice", hero.minPrice);
       setInputValue("smsMaxPrice", hero.maxPrice);
@@ -1618,6 +1689,7 @@ function html(): string {
     function smsPayloadFromForm() {
       return {
         countries: state.selectedSmsCountries,
+        apiKeyStrategy: $("smsApiKeyStrategy").value,
         acquirePriority: $("smsAcquirePriority").value,
         minPrice: Number($("smsMinPrice").value),
         maxPrice: Number($("smsMaxPrice").value),
@@ -1650,6 +1722,7 @@ function html(): string {
       setText("countFailed", pool.failed || 0);
       updateInflightButtons();
       updateHeroSmsBalance(data.heroSmsBalance);
+      updateHeroSmsRps(data.heroSmsRps);
       setText("runnerStatus", runner.status || "idle");
       updateMemory(runner.memory);
       renderWorkers(runner.workers || []);
@@ -1674,6 +1747,16 @@ function html(): string {
         applyStatusData(await apiJson("/api/status"));
       } catch (error) {
         if (state.authed) setText("taskMsg", error.message);
+      }
+    }
+
+    async function refreshHeroSmsRps() {
+      if (!state.authed) return;
+      try {
+        const data = await apiJson("/api/sms-rps");
+        updateHeroSmsRps(data.heroSmsRps);
+      } catch {
+        // RPS 是辅助状态，失败时等待下一轮刷新即可。
       }
     }
 
@@ -1982,6 +2065,7 @@ function html(): string {
       }
     });
     setInterval(refreshStatus, 2500);
+    setInterval(refreshHeroSmsRps, 1000);
   </script>
 </body>
 </html>`;

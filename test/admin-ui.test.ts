@@ -10,6 +10,7 @@ async function adminSource(): Promise<string> {
 test("sms config UI hides advanced HeroSMS fields", async () => {
     const source = await adminSource();
 
+    assert.match(source, /id="smsApiKeyStrategy"/);
     assert.doesNotMatch(source, /id="smsApiKey"/);
     assert.doesNotMatch(source, /id="smsProxyUrls"/);
     assert.doesNotMatch(source, /id="smsPollIntervalMs"/);
@@ -34,7 +35,9 @@ test("sms config save payload preserves hidden config fields", async () => {
     for (const hiddenField of ["apiKey", "proxyUrls", "pollIntervalMs", "autoReleaseOnTimeout"]) {
         assert.doesNotMatch(payloadSource, new RegExp(`${hiddenField}\\s*:`));
     }
-    for (const hiddenTomlKey of ["api_key", "api_keys", "api_key_strategy", "rps_limit", "proxy_urls", "poll_interval_ms", "auto_release_on_timeout"]) {
+    assert.match(payloadSource, /apiKeyStrategy\s*:/);
+    assert.match(valuesSource, /api_key_strategy\s*:/);
+    for (const hiddenTomlKey of ["api_key", "api_keys", "rps_limit", "proxy_urls", "poll_interval_ms", "auto_release_on_timeout"]) {
         assert.doesNotMatch(valuesSource, new RegExp(`${hiddenTomlKey}\\s*:`));
     }
 });

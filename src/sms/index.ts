@@ -36,11 +36,33 @@ interface KeyAccount {
   apiKey: string;
   label: string;
   provider: HeroSmsProvider;
-  requestTimestamps: number[];
   disabled: boolean;
 }
 
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 1000;
+
+interface KeyRateState {
+  apiKey: string;
+  label: string;
+  requestTimestamps: number[];
+  disabled: boolean;
+  lastRequestAt: number;
+}
+
+export interface HeroSmsKeyRpsSnapshot {
+  index: number;
+  label: string;
+  rps: number;
+  rpsLimit: number;
+  windowCount: number;
+  windowMs: number;
+  waitMs: number;
+  disabled: boolean;
+  lastRequestAt: string;
+}
+
+const keyRateStates = new Map<string, KeyRateState>();
+const keySetCursors = new Map<string, number>();
 
 function roundPrice(value: number): number {
   return Math.round(value * 10000) / 10000;
@@ -71,16 +93,83 @@ function isBadKeyError(error: unknown): boolean {
   return String((error as Error)?.message ?? error).toUpperCase().includes("BAD_KEY");
 }
 
-function pruneAccountWindow(account: KeyAccount, now: number, windowMs: number): void {
-  while (account.requestTimestamps.length && now - account.requestTimestamps[0] >= windowMs) {
-    account.requestTimestamps.shift();
+function rateStateFor(apiKey: string, label: string): KeyRateState {
+  const existing = keyRateStates.get(apiKey);
+  if (existing) {
+    existing.label = label;
+    return existing;
+  }
+  const created: KeyRateState = {
+    apiKey,
+    label,
+    requestTimestamps: [],
+    disabled: false,
+    lastRequestAt: 0,
+  };
+  keyRateStates.set(apiKey, created);
+  return created;
+}
+
+function pruneRateWindow(state: KeyRateState, now: number, windowMs: number): void {
+  while (state.requestTimestamps.length && now - state.requestTimestamps[0] >= windowMs) {
+    state.requestTimestamps.shift();
   }
 }
 
-function accountWaitMs(account: KeyAccount, now: number, windowMs: number): number {
-  pruneAccountWindow(account, now, windowMs);
-  const oldest = account.requestTimestamps[0];
+function stateWaitMs(state: KeyRateState, now: number, windowMs: number): number {
+  pruneRateWindow(state, now, windowMs);
+  const oldest = state.requestTimestamps[0];
   return oldest == null ? 1 : Math.max(1, windowMs - (now - oldest));
+}
+
+function normalizeRateLimitWindowMs(value?: number): number {
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : DEFAULT_RATE_LIMIT_WINDOW_MS;
+}
+
+function normalizeRpsLimit(value?: number): number {
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : 40;
+}
+
+function keySetId(apiKeys: string[]): string {
+  return apiKeys.join("\0");
+}
+
+function accountRateState(account: KeyAccount): KeyRateState {
+  return rateStateFor(account.apiKey, account.label);
+}
+
+export function getHeroSmsRpsStats(
+  apiKeys: string[],
+  options: {rpsLimit?: number; windowMs?: number} = {},
+): HeroSmsKeyRpsSnapshot[] {
+  const normalizedApiKeys = normalizeApiKeys(apiKeys);
+  const rpsLimit = normalizeRpsLimit(options.rpsLimit);
+  const windowMs = normalizeRateLimitWindowMs(options.windowMs);
+  const now = Date.now();
+
+  return normalizedApiKeys.map((apiKey, index): HeroSmsKeyRpsSnapshot => {
+    const label = `Key #${index + 1} ${redactHeroSmsKey(apiKey)}`;
+    const state = rateStateFor(apiKey, label);
+    pruneRateWindow(state, now, windowMs);
+    const windowCount = state.requestTimestamps.length;
+    const rps = Math.round((windowCount * 1000 / windowMs) * 100) / 100;
+    return {
+      index: index + 1,
+      label,
+      rps,
+      rpsLimit,
+      windowCount,
+      windowMs,
+      waitMs: windowCount >= rpsLimit ? stateWaitMs(state, now, windowMs) : 0,
+      disabled: state.disabled,
+      lastRequestAt: state.lastRequestAt > 0 ? new Date(state.lastRequestAt).toISOString() : "",
+    };
+  });
+}
+
+export function resetHeroSmsRpsStatsForTest(): void {
+  keyRateStates.clear();
+  keySetCursors.clear();
 }
 
 export function buildHeroSmsPriceTiers(minPrice: number, maxPrice: number, priceStep: number): number[] {
@@ -132,10 +221,8 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
   }
 
   const rpsLimit = Number.isInteger(option.rpsLimit) && option.rpsLimit > 0 ? option.rpsLimit : 40;
-  const configuredRateLimitWindowMs = option.rateLimitWindowMs ?? 0;
-  const rateLimitWindowMs = Number.isInteger(configuredRateLimitWindowMs) && configuredRateLimitWindowMs > 0
-    ? configuredRateLimitWindowMs
-    : DEFAULT_RATE_LIMIT_WINDOW_MS;
+  const rateLimitWindowMs = normalizeRateLimitWindowMs(option.rateLimitWindowMs);
+  const selectionKey = keySetId(apiKeys);
   const accountByActivationId = new Map<string, KeyAccount>();
   const accounts = apiKeys.map((apiKey, index): KeyAccount => ({
     index,
@@ -159,14 +246,11 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
         autoReleaseOnTimeout: option.autoReleaseOnTimeout,
       },
     }),
-    requestTimestamps: [],
     disabled: false,
   }));
 
-  let cursor = 0;
-
   function activeAccounts(): KeyAccount[] {
-    return accounts.filter((account) => !account.disabled);
+    return accounts.filter((account) => !account.disabled && !accountRateState(account).disabled);
   }
 
   async function selectAccount(): Promise<KeyAccount> {
@@ -178,29 +262,37 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
 
       const now = Date.now();
       for (const account of availableAccounts) {
-        pruneAccountWindow(account, now, rateLimitWindowMs);
+        pruneRateWindow(accountRateState(account), now, rateLimitWindowMs);
       }
 
       if (option.apiKeyStrategy === "fill_first") {
-        const selected = accounts.find((account) => !account.disabled && account.requestTimestamps.length < rpsLimit);
+        const selected = accounts.find((account) => {
+          const state = accountRateState(account);
+          return !account.disabled && !state.disabled && state.requestTimestamps.length < rpsLimit;
+        });
         if (selected) {
-          selected.requestTimestamps.push(now);
+          const state = accountRateState(selected);
+          state.requestTimestamps.push(now);
+          state.lastRequestAt = now;
           return selected;
         }
       } else {
+        const cursor = keySetCursors.get(selectionKey) ?? 0;
         for (let offset = 0; offset < accounts.length; offset += 1) {
           const index = (cursor + offset) % accounts.length;
           const selected = accounts[index];
           if (!selected) continue;
-          if (selected.disabled || selected.requestTimestamps.length >= rpsLimit) continue;
-          cursor = (index + 1) % accounts.length;
-          selected.requestTimestamps.push(now);
+          const state = accountRateState(selected);
+          if (selected.disabled || state.disabled || state.requestTimestamps.length >= rpsLimit) continue;
+          keySetCursors.set(selectionKey, (index + 1) % accounts.length);
+          state.requestTimestamps.push(now);
+          state.lastRequestAt = now;
           return selected;
         }
       }
 
       const waitMs = Math.min(
-        ...availableAccounts.map((account) => accountWaitMs(account, now, rateLimitWindowMs)),
+        ...availableAccounts.map((account) => stateWaitMs(accountRateState(account), now, rateLimitWindowMs)),
       );
       console.warn(`[heroSMS] 所有 API key 均达到 getNumberV2 RPS 限制，等待 ${waitMs}ms`);
       await sleep(waitMs);
@@ -231,6 +323,7 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
           throw error;
         }
         account.disabled = true;
+        accountRateState(account).disabled = true;
         console.warn(`[heroSMS] ${account.label} 返回 BAD_KEY，已在当前进程停用`);
         if (!activeAccounts().length) {
           throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
