@@ -4,6 +4,7 @@ npm-debug.log
 .gitignore
 .DS_Store
 
+.env
 config.toml
 email.txt
 email.success.txt
@@ -11,5 +12,8 @@ email.inflight.txt
 email.failed.txt
 .email.lock
 auth
+hotmail
 cpa_json
+.cache
+backups
 *.bak

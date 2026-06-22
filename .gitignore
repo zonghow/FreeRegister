@@ -3,6 +3,7 @@ npm-debug.log
 .DS_Store
 
 # Local secrets and mutable run state.
+.env
 config.toml
 email.txt
 email.success.txt
