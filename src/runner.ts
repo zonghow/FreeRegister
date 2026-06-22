@@ -18,6 +18,36 @@ export interface RegisterLogger {
 }
 
 export type RunnerStatus = "idle" | "running" | "pausing" | "force_pausing" | "paused" | "force_paused" | "completed" | "failed";
+export type WorkerStatus = "idle" | "running" | "success" | "failed" | "skipped" | "paused" | "force_paused";
+export type WorkerStage =
+    | "idle"
+    | "leasing_email"
+    | "phone_acquire"
+    | "phone_signup"
+    | "phone_sms_wait"
+    | "phone_registered"
+    | "oauth_start"
+    | "email_otp_wait"
+    | "oauth_exchange"
+    | "success"
+    | "failed"
+    | "skipped"
+    | "force_paused";
+
+export interface WorkerSnapshot {
+    workerId: number;
+    status: WorkerStatus;
+    stage: WorkerStage;
+    jobId: number;
+    email: string;
+    phone: string;
+    proxy: string;
+    startedAt: string;
+    updatedAt: string;
+    elapsedMs: number;
+    latestLog: string;
+    error: string;
+}
 
 export interface RunnerSnapshot {
     status: RunnerStatus;
@@ -32,6 +62,7 @@ export interface RunnerSnapshot {
     startedAt: string;
     endedAt: string;
     lastError: string;
+    workers: WorkerSnapshot[];
 }
 
 const DEFAULT_LOGGER: RegisterLogger = {
@@ -72,8 +103,38 @@ function emptySnapshot(): RunnerSnapshot {
         startedAt: "",
         endedAt: "",
         lastError: "",
+        workers: [],
     };
 }
+
+function emptyWorkerSnapshot(workerId: number): WorkerSnapshot {
+    return {
+        workerId,
+        status: "idle",
+        stage: "idle",
+        jobId: 0,
+        email: "",
+        phone: "",
+        proxy: "",
+        startedAt: "",
+        updatedAt: "",
+        elapsedMs: 0,
+        latestLog: "等待任务",
+        error: "",
+    };
+}
+
+function withElapsed(worker: WorkerSnapshot): WorkerSnapshot {
+    const startedAt = Date.parse(worker.startedAt);
+    const updatedAt = Date.parse(worker.updatedAt);
+    const end = Number.isFinite(updatedAt) ? updatedAt : Date.now();
+    return {
+        ...worker,
+        elapsedMs: Number.isFinite(startedAt) ? Math.max(0, end - startedAt) : 0,
+    };
+}
+
+type WorkerUpdate = (patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>) => void;
 
 function createBroker(config: AppConfig) {
     const hero = config.heroSMS;
@@ -103,16 +164,28 @@ async function phoneSignup(
     workerId: number,
     logger: RegisterLogger,
     signal?: AbortSignal,
+    updateWorker?: WorkerUpdate,
 ): Promise<{phone: string}> {
     const smsBroker = createBroker(config);
     let lastErr: unknown = null;
 
     for (let phoneTry = 1; phoneTry <= config.heroSMS.maxPhoneTries; phoneTry += 1) {
         throwIfForcePaused(signal);
+        updateWorker?.({
+            status: "running",
+            stage: "phone_acquire",
+            latestLog: `取号 (${phoneTry}/${config.heroSMS.maxPhoneTries})`,
+        });
         logger.info(`\n[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 取号...`);
         const lease = await smsBroker.getActivation();
         throwIfForcePaused(signal);
         const phoneNumber = `+${lease.phoneNumber}`;
+        updateWorker?.({
+            status: "running",
+            stage: "phone_signup",
+            phone: phoneNumber,
+            latestLog: `取到号码 ${phoneNumber}`,
+        });
         logger.info(`[worker-${workerId}] [phone] 取到号码 ${phoneNumber}`);
 
         const signupClient = new OpenAIClient({
@@ -131,13 +204,31 @@ async function phoneSignup(
         try {
             await signupClient.authPhoneSignupHTTP(phoneNumber, async () => {
                 throwIfForcePaused(signal);
+                updateWorker?.({
+                    status: "running",
+                    stage: "phone_sms_wait",
+                    phone: phoneNumber,
+                    latestLog: "等待手机 OTP",
+                });
                 logger.info(`[worker-${workerId}] [phone] 等待 OTP...`);
                 const {code} = await lease.waitForVerificationCode({signal});
                 throwIfForcePaused(signal);
+                updateWorker?.({
+                    status: "running",
+                    stage: "phone_signup",
+                    phone: phoneNumber,
+                    latestLog: "收到手机 OTP",
+                });
                 logger.info(`[worker-${workerId}] [phone] 收到 OTP: ${code}`);
                 return code;
             });
             throwIfForcePaused(signal);
+            updateWorker?.({
+                status: "running",
+                stage: "phone_registered",
+                phone: phoneNumber,
+                latestLog: `手机注册成功 ${phoneNumber}`,
+            });
             logger.info(`[worker-${workerId}] [phone] 注册成功 ${phoneNumber}`);
             return {phone: phoneNumber};
         } catch (error) {
@@ -150,6 +241,13 @@ async function phoneSignup(
                 throw createForcePauseError();
             }
             lastErr = error;
+            updateWorker?.({
+                status: "running",
+                stage: "phone_acquire",
+                phone: phoneNumber,
+                latestLog: `手机号失败，准备换号: ${(error as Error).message}`,
+                error: (error as Error).message,
+            });
             logger.warn(`[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 失败: ${(error as Error).message}`);
             try {
                 await smsBroker.markAsFailed(true);
@@ -171,10 +269,19 @@ async function bindEmailViaOAuth(
     workerId: number,
     logger: RegisterLogger,
     signal?: AbortSignal,
+    updateWorker?: WorkerUpdate,
 ): Promise<void> {
     throwIfForcePaused(signal);
     const hotmailProvider = createHotmailProvider({lease, pool, proxyUrl});
     const bindEmail = await hotmailProvider.getEmailAddress();
+    updateWorker?.({
+        status: "running",
+        stage: "oauth_start",
+        email: bindEmail,
+        phone,
+        latestLog: `绑定邮箱候选 ${bindEmail}`,
+        error: "",
+    });
     logger.info(`[worker-${workerId}] [oauth] 绑定邮箱候选: ${bindEmail}`);
 
     const oauthClient = new OpenAIClient({
@@ -186,9 +293,23 @@ async function bindEmailViaOAuth(
         fetchAddEmailOtp: async () => {
             throwIfForcePaused(signal);
             const startedAt = Date.now();
+            updateWorker?.({
+                status: "running",
+                stage: "email_otp_wait",
+                email: bindEmail,
+                phone,
+                latestLog: "等待邮箱 OTP",
+            });
             logger.info(`[worker-${workerId}] [email] 等待 OTP for ${bindEmail} (after=${new Date(startedAt).toISOString()})`);
             const code = await hotmailProvider.getEmailVerificationCode(bindEmail, {minTimestampMs: startedAt, signal});
             throwIfForcePaused(signal);
+            updateWorker?.({
+                status: "running",
+                stage: "oauth_exchange",
+                email: bindEmail,
+                phone,
+                latestLog: "收到邮箱 OTP，继续 OAuth",
+            });
             return code;
         },
         proxyUrl,
@@ -199,8 +320,22 @@ async function bindEmailViaOAuth(
         abortSignal: signal,
     });
 
+    updateWorker?.({
+        status: "running",
+        stage: "oauth_exchange",
+        email: bindEmail,
+        phone,
+        latestLog: "Codex OAuth 中",
+    });
     const authResult = await oauthClient.authLoginHTTP();
     throwIfForcePaused(signal);
+    updateWorker?.({
+        status: "running",
+        stage: "oauth_exchange",
+        email: bindEmail,
+        phone,
+        latestLog: `OAuth 完成 cpa_json=${authResult.authFile || "not-saved"}`,
+    });
     logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} cpa_json=${authResult.authFile || "not-saved"}`);
 }
 
@@ -211,43 +346,95 @@ export async function runOne(
     workerId: number,
     logger: RegisterLogger = DEFAULT_LOGGER,
     signal?: AbortSignal,
+    updateWorker?: WorkerUpdate,
 ): Promise<JobResult> {
     throwIfForcePaused(signal);
     const proxyUrl = proxyForWorker(config, workerId - 1);
     const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(config.run.total);
+    updateWorker?.({
+        status: "running",
+        stage: "leasing_email",
+        jobId,
+        email: "",
+        phone: "",
+        proxy: redactProxy(proxyUrl),
+        startedAt: new Date().toISOString(),
+        latestLog: `job ${jobId}/${totalLabel} 开始`,
+        error: "",
+    });
     logger.info(`\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxy=${redactProxy(proxyUrl)} ==========`);
 
     const emailLease = await pool.leaseEmail();
     if (!emailLease) {
+        updateWorker?.({
+            status: "skipped",
+            stage: "skipped",
+            latestLog: `邮箱池为空，跳过 job=${jobId}`,
+        });
         logger.warn(`[worker-${workerId}] 邮箱池为空，跳过 job=${jobId}`);
         return {ok: false, skipped: true};
     }
+    updateWorker?.({
+        status: "running",
+        stage: "phone_acquire",
+        email: emailLease.email,
+        latestLog: `已租约 ${emailLease.email}`,
+    });
     logger.info(`[worker-${workerId}] [email] 已租约 ${emailLease.email}`);
 
     let phone = "";
     try {
-        const signup = await phoneSignup(config, proxyUrl, workerId, logger, signal);
+        const signup = await phoneSignup(config, proxyUrl, workerId, logger, signal, updateWorker);
         phone = signup.phone;
     } catch (error) {
         if (signal?.aborted) {
+            updateWorker?.({
+                status: "force_paused",
+                stage: "force_paused",
+                email: emailLease.email,
+                latestLog: `手机阶段中止，邮箱放回池: ${emailLease.email}`,
+            });
             logger.warn(`[worker-${workerId}] [force-pause] 手机阶段中止，邮箱放回池: ${emailLease.email}`);
             await pool.returnToSource(emailLease);
             return {ok: false, forced: true};
         }
+        updateWorker?.({
+            status: "failed",
+            stage: "failed",
+            email: emailLease.email,
+            latestLog: `手机注册失败，邮箱放回池: ${(error as Error).message}`,
+            error: (error as Error).message,
+        });
         logger.warn(`[worker-${workerId}] [phone] 注册失败，邮箱放回池: ${(error as Error).message}`);
         await pool.returnToSource(emailLease);
         return {ok: false};
     }
 
     try {
-        await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal);
+        await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal, updateWorker);
         await pool.markSuccess(emailLease);
+        updateWorker?.({
+            status: "success",
+            stage: "success",
+            email: emailLease.email,
+            phone,
+            latestLog: `成功 phone=${phone} email=${emailLease.email}`,
+            error: "",
+        });
         logger.info(`[worker-${workerId}] [success] phone=${phone} email=${emailLease.email}`);
         logger.info(`[POOL-RESULT] status=ok phone=${phone} email=${emailLease.email}`);
         return {ok: true};
     } catch (error) {
         if (signal?.aborted) {
             const reason = `force_paused: ${FORCE_PAUSE_MESSAGE}`;
+            updateWorker?.({
+                status: "force_paused",
+                stage: "force_paused",
+                email: emailLease.email,
+                phone,
+                latestLog: reason,
+                error: reason,
+            });
             logger.warn(`[worker-${workerId}] [force-pause] email=${emailLease.email} reason=${reason}`);
             await pool.markFailed(emailLease, reason);
             logger.info(`[POOL-RESULT] status=force-paused phone=${phone} email=${emailLease.email}`);
@@ -255,6 +442,14 @@ export async function runOne(
         }
         const message = error instanceof Error ? error.message : String(error);
         const reason = isEmailTouchedError(error) ? message : `oauth_uncertain: ${message}`;
+        updateWorker?.({
+            status: "failed",
+            stage: "failed",
+            email: emailLease.email,
+            phone,
+            latestLog: reason,
+            error: reason,
+        });
         logger.warn(`[worker-${workerId}] [failed] email=${emailLease.email} reason=${reason}`);
         await pool.markFailed(emailLease, reason);
         logger.info(`[POOL-RESULT] status=failed phone=${phone} email=${emailLease.email}`);
@@ -290,6 +485,7 @@ export class RegisterTaskRunner {
             concurrency,
             runUntilEmpty: config.run.runUntilEmpty,
             startedAt: new Date().toISOString(),
+            workers: Array.from({length: concurrency}, (_, index) => emptyWorkerSnapshot(index + 1)),
         };
 
         this.promise = this.run(config)
@@ -302,6 +498,15 @@ export class RegisterTaskRunner {
             .finally(() => {
                 this.snapshot.endedAt = new Date().toISOString();
                 this.snapshot.activeWorkers = 0;
+                for (const worker of this.snapshot.workers) {
+                    if (worker.status === "running") {
+                        this.updateWorker(worker.workerId, {
+                            status: this.forcePauseRequested ? "force_paused" : "idle",
+                            stage: this.forcePauseRequested ? "force_paused" : "idle",
+                            latestLog: this.forcePauseRequested ? "已强制暂停" : "已停止",
+                        });
+                    }
+                }
             });
 
         return this.getSnapshot();
@@ -332,7 +537,22 @@ export class RegisterTaskRunner {
     }
 
     getSnapshot(): RunnerSnapshot {
-        return {...this.snapshot};
+        return {
+            ...this.snapshot,
+            workers: this.snapshot.workers.map(withElapsed),
+        };
+    }
+
+    private updateWorker(workerId: number, patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>): void {
+        const index = workerId - 1;
+        const existing = this.snapshot.workers[index] ?? emptyWorkerSnapshot(workerId);
+        const next = {
+            ...existing,
+            ...patch,
+            workerId,
+            updatedAt: new Date().toISOString(),
+        };
+        this.snapshot.workers[index] = withElapsed(next);
     }
 
     private async run(config: AppConfig): Promise<RunnerSnapshot> {
@@ -346,17 +566,41 @@ export class RegisterTaskRunner {
         const worker = async (workerId: number): Promise<void> => {
             for (;;) {
                 if (this.pauseRequested || this.forcePauseRequested) {
+                    this.updateWorker(workerId, {
+                        status: this.forcePauseRequested ? "force_paused" : "paused",
+                        stage: this.forcePauseRequested ? "force_paused" : "idle",
+                        jobId: 0,
+                        email: "",
+                        phone: "",
+                        latestLog: this.forcePauseRequested ? "强制暂停" : "暂停，不再派发新任务",
+                    });
                     return;
                 }
                 const jobId = this.snapshot.nextJob;
                 if (!config.run.runUntilEmpty && jobId > this.snapshot.total) {
+                    this.updateWorker(workerId, {
+                        status: "idle",
+                        stage: "idle",
+                        jobId: 0,
+                        email: "",
+                        phone: "",
+                        latestLog: "没有更多任务",
+                    });
                     return;
                 }
                 this.snapshot.nextJob += 1;
 
                 this.snapshot.activeWorkers += 1;
                 try {
-                    const result = await runOne(config, pool, jobId, workerId, this.logger, this.abortController?.signal);
+                    const result = await runOne(
+                        config,
+                        pool,
+                        jobId,
+                        workerId,
+                        this.logger,
+                        this.abortController?.signal,
+                        (patch) => this.updateWorker(workerId, patch),
+                    );
                     if (result.forced) {
                         return;
                     }
@@ -365,6 +609,14 @@ export class RegisterTaskRunner {
                     } else if (result.skipped) {
                         this.snapshot.skippedCount += 1;
                         if (config.run.runUntilEmpty) {
+                            this.updateWorker(workerId, {
+                                status: "idle",
+                                stage: "idle",
+                                jobId: 0,
+                                email: "",
+                                phone: "",
+                                latestLog: "邮箱池为空，停止 worker",
+                            });
                             return;
                         }
                     } else {
@@ -381,6 +633,12 @@ export class RegisterTaskRunner {
                 return;
             }
             this.snapshot.failedCount += 1;
+            this.updateWorker(index + 1, {
+                status: "failed",
+                stage: "failed",
+                latestLog: error instanceof Error ? error.message : String(error),
+                error: error instanceof Error ? error.stack || error.message : String(error),
+            });
             this.logger.error(`[worker-${index + 1}] 未处理错误: ${error instanceof Error ? error.stack || error.message : String(error)}`);
             await noop();
         })));

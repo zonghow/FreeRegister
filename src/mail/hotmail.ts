@@ -552,7 +552,7 @@ function normalizeMessage(message, folderId) {
     };
 }
 
-async function listFolderMessages(account, folderId) {
+async function listFolderMessages(account, folderId, options = {}) {
     // 先刷新 token，确保 scope 已就绪
     await ensureFreshAccount(account);
     const apiMode = account.apiMode ?? resolveApiMode(account);
@@ -561,7 +561,7 @@ async function listFolderMessages(account, folderId) {
     // 优先尝试 IMAP，失败再 fallback 到 REST/Graph
     if (apiMode === "rest") {
         try {
-            return await listFolderMessagesViaImap(account, folderId);
+            return await listFolderMessagesViaImap(account, folderId, options);
         } catch (err) {
             console.warn(`Hotmail IMAP 读邮件失败，fallback REST: ${err?.message ?? err}`);
         }
@@ -594,7 +594,7 @@ function mapFolderIdToImap(folderId) {
     return folderId;
 }
 
-async function listFolderMessagesViaImap(account, folderId) {
+async function listFolderMessagesViaImap(account, folderId, options = {}) {
     const mailbox = mapFolderIdToImap(folderId);
     const {client, guard} = createImapClient(account, `list:${folderId}`);
 
@@ -618,7 +618,9 @@ async function listFolderMessagesViaImap(account, folderId) {
         try {
             const status = client.mailbox;
             const total = Number(status?.exists ?? 0);
-            console.log(`hotmailImapMailbox: account=${account.loginHint} folder=${folderId} resolved=${resolvedMailbox} total=${total}`);
+            if (options.logSummary) {
+                console.log(`hotmailImapMailbox: account=${account.loginHint} folder=${folderId} resolved=${resolvedMailbox} total=${total}`);
+            }
             if (!total) {
                 return [];
             }
@@ -675,11 +677,11 @@ async function listFolderMessagesViaImap(account, folderId) {
     return messages;
 }
 
-async function getLatestVerificationMessage(targetEmail, account, minTimestampMs = 0) {
+async function getLatestVerificationMessage(targetEmail, account, minTimestampMs = 0, options = {}) {
     const messages = [];
 
     for (const folderId of HOTMAIL_FOLDER_IDS) {
-        const folderMessages = await listFolderMessages(account, folderId);
+        const folderMessages = await listFolderMessages(account, folderId, options);
         messages.push(...folderMessages);
     }
 
@@ -694,15 +696,14 @@ async function getLatestVerificationMessage(targetEmail, account, minTimestampMs
     const debugLines = filtered.slice(0, 5).map((m) =>
         `  [${m.folderId}] from=${m.from} to=${(m.toRecipients ?? []).join(',')} subject=${(m.subject ?? '').slice(0, 80)} bodyLen=${(m.bodyPreview ?? '').length} time=${new Date(m.receivedAtMs ?? 0).toISOString()}`
     );
-    if (debugLines.length) {
+    if (options.logDetails && debugLines.length) {
         console.log(`hotmailMessagesDebug: targetEmail=${targetEmail} (after=${minTimestampMs ? new Date(minTimestampMs).toISOString() : 'any'})\n${debugLines.join("\n")}`);
     }
-    if (filtered[0]?.bodyPreview) {
+    if (options.logDetails && filtered[0]?.bodyPreview) {
         console.log(`hotmailFirstBodyPreview: ${filtered[0].bodyPreview.slice(0, 300).replace(/\s+/g, " ")}`);
     }
 
-    console.log(`hotmailMessagesFetched: targetEmail=${targetEmail} mailbox=${account.loginHint} total=${messages.length} kept=${filtered.length}`);
-    return findLatestVerificationMail(
+    const matched = findLatestVerificationMail(
         filtered.map((message) => ({
             ...message,
             recipient: message.toRecipients,
@@ -718,6 +719,10 @@ async function getLatestVerificationMessage(targetEmail, account, minTimestampMs
                 ),
         },
     );
+    if (options.logSummary || matched?.verificationCode) {
+        console.log(`hotmailMessagesFetched: targetEmail=${targetEmail} mailbox=${account.loginHint} total=${messages.length} kept=${filtered.length} matched=${Boolean(matched?.verificationCode)}`);
+    }
+    return matched;
 }
 
 function delay(ms, signal) {
@@ -733,6 +738,10 @@ function delay(ms, signal) {
     });
 }
 
+function shouldLogPollProgress(attempt, total, every = 10) {
+    return attempt === 1 || attempt === total || attempt % every === 0;
+}
+
 async function pollHotmailVerificationCode(targetEmail, account, minTimestampMs = 0, options = {}) {
     const attempts = options.attempts ?? HOTMAIL_FAST_POLL_ATTEMPTS;
     const intervalMs = options.intervalMs ?? HOTMAIL_FAST_POLL_INTERVAL_MS;
@@ -740,16 +749,24 @@ async function pollHotmailVerificationCode(targetEmail, account, minTimestampMs 
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
         if (signal?.aborted) return null;
-        console.log(`pollHotmailOtp: attempt=${attempt}/${attempts} targetEmail=${targetEmail}`);
+        const logProgress = shouldLogPollProgress(attempt, attempts);
+        if (logProgress) {
+            console.log(`pollHotmailOtp: attempt=${attempt}/${attempts} targetEmail=${targetEmail}`);
+        }
         try {
-            const message = await getLatestVerificationMessage(targetEmail, account, minTimestampMs);
+            const message = await getLatestVerificationMessage(targetEmail, account, minTimestampMs, {
+                logSummary: logProgress,
+                logDetails: attempt === attempts,
+            });
             if (message?.verificationCode) {
                 console.log(`hotmailOtpCode: ${message.verificationCode} (via poll)`);
                 console.log(`hotmailOtpFolder: ${message.folderId}`);
                 return message.verificationCode;
             }
         } catch (err) {
-            console.warn(`pollHotmailOtp: attempt=${attempt} 读邮件失败: ${(err as Error).message}`);
+            if (logProgress) {
+                console.warn(`pollHotmailOtp: attempt=${attempt} 读邮件失败: ${(err as Error).message}`);
+            }
         }
         if (attempt < attempts) {
             await delay(intervalMs, signal);
@@ -921,8 +938,8 @@ async function waitForVerificationViaIdle(targetEmail, account, minTimestampMs =
                 }
 
                 // 进入 IDLE 循环：等待新邮件到达
+                console.log(`hotmailIdle: waiting on ${mailboxPath} for ${targetEmail}...`);
                 while (!signal.aborted) {
-                    console.log(`hotmailIdle: waiting on ${mailboxPath} for ${targetEmail}...`);
                     // idle() 会阻塞直到有新事件或超时
                     // imapflow 的 idle() 在收到 EXISTS 等通知后自动 resolve
                     await guard.race(client.idle(), signal);

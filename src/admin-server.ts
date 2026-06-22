@@ -33,8 +33,12 @@ interface HeroSmsCountriesStatus {
 
 const DEFAULT_PORT = 8788;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-const MAX_LOG_LINES = 2000;
-const MAX_LOG_LINE_CHARS = 5000;
+const MAX_LOG_LINES = 10000;
+const MAX_LOG_LINE_CHARS = 2000;
+const MAX_LOG_BACKLOG_LINES = 300;
+const LOG_BROADCAST_INTERVAL_MS = 250;
+const MAX_LOG_BROADCAST_BATCH = 500;
+const MAX_SSE_WRITABLE_BUFFER_BYTES = 1024 * 1024;
 const SESSION_COOKIE = "fr_session";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const HERO_SMS_BALANCE_TTL_MS = 30 * 1000;
@@ -77,6 +81,8 @@ const HERO_SMS_FALLBACK_COUNTRIES = [
 class LogBuffer implements RegisterLogger {
     private readonly lines: LogEntry[] = [];
     private readonly subscribers = new Map<number, ServerResponse>();
+    private readonly pendingBroadcasts: LogEntry[] = [];
+    private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
     private nextId = 1;
     private nextSubscriberId = 1;
 
@@ -125,17 +131,50 @@ class LogBuffer implements RegisterLogger {
             };
             this.nextId += 1;
             this.lines.push(entry);
-            this.broadcast(entry);
+            this.queueBroadcast(entry);
         }
         if (this.lines.length > MAX_LOG_LINES) {
             this.lines.splice(0, this.lines.length - MAX_LOG_LINES);
         }
     }
 
-    private broadcast(entry: LogEntry): void {
-        const payload = sseEntry(entry);
+    private queueBroadcast(entry: LogEntry): void {
+        this.pendingBroadcasts.push(entry);
+        if (this.pendingBroadcasts.length >= MAX_LOG_BROADCAST_BATCH) {
+            this.flushBroadcasts();
+            return;
+        }
+        if (!this.broadcastTimer) {
+            this.broadcastTimer = setTimeout(() => this.flushBroadcasts(), LOG_BROADCAST_INTERVAL_MS);
+        }
+    }
+
+    private flushBroadcasts(): void {
+        if (this.broadcastTimer) {
+            clearTimeout(this.broadcastTimer);
+            this.broadcastTimer = null;
+        }
+
+        if (!this.pendingBroadcasts.length) {
+            return;
+        }
+
+        const entries = this.pendingBroadcasts.splice(0, MAX_LOG_BROADCAST_BATCH);
+        this.broadcast(sseEntries(entries));
+        if (this.pendingBroadcasts.length) {
+            this.broadcastTimer = setTimeout(() => this.flushBroadcasts(), 0);
+        }
+    }
+
+    private broadcast(payload: string): void {
+        if (!payload) return;
         for (const [id, res] of this.subscribers) {
             if (res.destroyed || res.writableEnded) {
+                this.subscribers.delete(id);
+                continue;
+            }
+            if (res.writableLength > MAX_SSE_WRITABLE_BUFFER_BYTES) {
+                res.end();
                 this.subscribers.delete(id);
                 continue;
             }
@@ -188,8 +227,10 @@ function formatConsoleArgs(args: unknown[]): string {
     }).join(" ");
 }
 
-function sseEntry(entry: LogEntry): string {
-    return `id: ${entry.id}\nevent: log\ndata: ${JSON.stringify(entry)}\n\n`;
+function sseEntries(entries: LogEntry[]): string {
+    if (!entries.length) return "";
+    const lastId = entries[entries.length - 1]?.id ?? 0;
+    return `id: ${lastId}\nevent: logs\ndata: ${JSON.stringify(entries)}\n\n`;
 }
 
 function configPath(): string {
@@ -276,10 +317,10 @@ function sendLogStream(req: IncomingMessage, res: ServerResponse): void {
     });
 
     const backlog = Number.isFinite(lastId) && lastId > 0
-        ? logger.recentAfter(lastId)
-        : logger.recent(250) as unknown as LogEntry[];
-    for (const entry of backlog) {
-        res.write(sseEntry(entry));
+        ? logger.recentAfter(lastId, MAX_LOG_BACKLOG_LINES)
+        : logger.recent(MAX_LOG_BACKLOG_LINES) as unknown as LogEntry[];
+    if (backlog.length) {
+        res.write(sseEntries(backlog));
     }
     res.write(`event: ready\ndata: ${JSON.stringify({ok: true})}\n\n`);
 
@@ -575,14 +616,14 @@ async function heroSmsCountriesStatus(config: AppConfig, refresh = false): Promi
     }
 }
 
-async function heroSmsBalanceStatus(config: AppConfig): Promise<JsonValue> {
+async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: boolean} = {}): Promise<JsonValue> {
     if (!config.heroSMS.apiKey) {
         return {ok: false, error: "HeroSMS api_key 未配置"};
     }
 
     const key = heroSmsBalanceCacheKey(config);
     const now = Date.now();
-    if (heroSmsBalanceCache?.key === key && heroSmsBalanceCache.expiresAt > now) {
+    if (!options.forceRefresh && heroSmsBalanceCache?.key === key && heroSmsBalanceCache.expiresAt > now) {
         return {...heroSmsBalanceCache.value as Record<string, JsonValue>, cached: true};
     }
 
@@ -717,7 +758,7 @@ async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string)
     return {buffer, matched: cpaFiles.size, missing};
 }
 
-async function currentStatus(): Promise<JsonValue> {
+async function currentStatus(options: {refreshBalance?: boolean} = {}): Promise<JsonValue> {
     try {
         const config = loadConfig();
         const pool = new EmailPool(config.emailPool);
@@ -725,7 +766,7 @@ async function currentStatus(): Promise<JsonValue> {
             ok: true,
             runner: runner.getSnapshot() as unknown as JsonValue,
             pool: await pool.stats() as unknown as JsonValue,
-            heroSmsBalance: await heroSmsBalanceStatus(config),
+            heroSmsBalance: await heroSmsBalanceStatus(config, {forceRefresh: options.refreshBalance}),
             configPath: configPath(),
             effectiveConfig: publicConfigSummary(config),
         };
@@ -768,7 +809,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
     }
 
     if (pathname === "/api/status" && req.method === "GET") {
-        sendJson(res, 200, await currentStatus());
+        const url = new URL(req.url ?? "/", "http://localhost");
+        sendJson(res, 200, await currentStatus({refreshBalance: url.searchParams.get("refreshBalance") === "1"}));
         return;
     }
 
@@ -918,18 +960,20 @@ function html(): string {
     body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.38 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); background: rgba(247,247,245,.9); position: sticky; top: 0; backdrop-filter: blur(12px); }
     h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
-    main { width: min(1280px, calc(100vw - 24px)); margin: 12px auto 28px; display: grid; gap: 10px; }
+    main { width: min(1280px, calc(100vw - 24px)); max-width: calc(100vw - 24px); min-width: 0; margin: 12px auto 28px; display: grid; gap: 10px; }
     .grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+    .panel { min-width: 0; max-width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
     .panel h2 { margin: 0; font-size: 13px; font-weight: 650; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .metric { color: var(--muted); font-size: 11px; padding-block: 8px; }
+    .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .icon-button { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-color: var(--line); background: #fff; color: var(--text); line-height: 1; }
     .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .split-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-    .stack { display: grid; gap: 8px; }
+    .stack { min-width: 0; display: grid; gap: 8px; }
     button, input, textarea { font: inherit; }
     button { height: 30px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
     button.secondary { background: #fff; color: var(--text); border-color: var(--line); }
@@ -945,6 +989,9 @@ function html(): string {
     .readonly-field { display: flex; align-items: center; min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); color: var(--text); font-size: 13px; }
     .check-row { height: 30px; display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
     .check-row input { min-width: 0; width: 15px; height: 15px; }
+    .form-grid .country-field { grid-column: span 3; }
+    .country-picker-row { display: grid; grid-template-columns: minmax(120px, .8fr) minmax(150px, 1fr) auto; gap: 6px; align-items: center; }
+    .country-picker-row input, .country-picker-row select { min-width: 0; width: 100%; }
     .country-list { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; }
     .country-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; background: #fafafa; }
     .country-pill button { width: 22px; height: 22px; padding: 0; border-color: var(--line); background: #fff; color: var(--text); }
@@ -958,7 +1005,25 @@ function html(): string {
     .cm-atom, .cm-number { color: #8a4d1c; }
     .cm-string { color: #1b6b68; }
     .cm-keyword, .cm-property { color: #403f3c; font-weight: 600; }
-    #logs { min-height: 260px; max-height: 420px; overflow: auto; white-space: pre-wrap; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #111; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.38; }
+    .worker-table-wrap { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    .worker-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    .worker-table th, .worker-table td { padding: 6px 7px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .worker-table th { position: sticky; top: 0; z-index: 1; background: #fafafa; color: var(--muted); font-weight: 650; }
+    .worker-table tr:last-child td { border-bottom: 0; }
+    .worker-table .worker-col-id { width: 48px; }
+    .worker-table .worker-col-status { width: 82px; }
+    .worker-table .worker-col-stage { width: 108px; }
+    .worker-table .worker-col-job { width: 64px; }
+    .worker-table .worker-col-phone { width: 118px; }
+    .worker-table .worker-col-time { width: 72px; }
+    .worker-table .worker-col-log { width: 34%; }
+    .worker-status { display: inline-flex; align-items: center; max-width: 100%; min-height: 20px; padding: 1px 6px; border-radius: 999px; background: #ececea; color: #333; font-size: 11px; }
+    .worker-status.running { background: #dff2ea; color: #14533e; }
+    .worker-status.failed { background: #fde5df; color: #7a2a16; }
+    .worker-status.success { background: #e1edf9; color: #174166; }
+    #logsBody { min-width: 0; max-width: 100%; overflow: hidden; }
+    #logsBody[hidden] { display: none; }
+    #logs { width: 100%; max-width: 100%; min-height: 260px; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #111; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.38; }
     #login { max-width: 360px; margin: 18vh auto; }
     #app { display: none; }
     .modal-backdrop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(20,20,18,.42); z-index: 20; }
@@ -970,8 +1035,8 @@ function html(): string {
     .muted { color: var(--muted); }
     .status { padding: 3px 8px; border-radius: 999px; background: #ececea; color: #333; font-size: 12px; }
     .msg { min-height: 18px; color: var(--muted); }
-    @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide { grid-column: span 2; } }
-    @media (max-width: 760px) { header { padding: 0 12px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 900px) { .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .form-grid .wide, .form-grid .country-field { grid-column: span 2; } }
+    @media (max-width: 760px) { header { padding: 0 12px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .country-picker-row { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -996,7 +1061,7 @@ function html(): string {
         <div class="panel metric">成功<strong id="countSuccess">0</strong></div>
         <div class="panel metric">进行中<strong id="countInflight">0</strong></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
-        <div class="panel metric">HeroSMS 余额<strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
+        <div class="panel metric"><div class="metric-head"><span>HeroSMS 余额</span><button id="refreshHeroSmsBalanceBtn" type="button" class="icon-button" title="刷新余额" aria-label="刷新余额"><span aria-hidden="true">&#8635;</span></button></div><strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
       </section>
 
       <section class="panel stack">
@@ -1018,6 +1083,29 @@ function html(): string {
           </div>
         </div>
         <div class="panel-head">
+          <h2>线程状态</h2>
+          <span id="workerSummary" class="muted">0 / 0 running</span>
+        </div>
+        <div class="worker-table-wrap">
+          <table class="worker-table">
+            <thead>
+              <tr>
+                <th class="worker-col-id">线程</th>
+                <th class="worker-col-status">状态</th>
+                <th class="worker-col-stage">阶段</th>
+                <th class="worker-col-job">Job</th>
+                <th>邮箱</th>
+                <th class="worker-col-phone">手机号</th>
+                <th class="worker-col-time">耗时</th>
+                <th class="worker-col-log">最新日志</th>
+              </tr>
+            </thead>
+            <tbody id="workerRows">
+              <tr><td colspan="8">暂无线程</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel-head">
           <h2>接码配置</h2>
           <span id="smsConfigMsg" class="msg"></span>
         </div>
@@ -1035,7 +1123,7 @@ function html(): string {
           <label><span>轮询间隔 ms</span><input id="smsPollIntervalMs" type="number" min="500" step="100"></label>
           <label><span>最多轮询</span><span id="smsPollAttempts" class="readonly-field">自动计算</span></label>
           <label><span>超时处理</span><span class="check-row"><input id="smsAutoRelease" type="checkbox">自动释放号码</span></label>
-          <label class="wide"><span>添加国家 <em id="smsCountrySource" class="muted"></em></span><span class="row"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
+          <label class="country-field"><span>添加国家 <em id="smsCountrySource" class="muted"></em></span><span class="country-picker-row"><input id="smsCountrySearch" placeholder="搜索国家 / ID" autocomplete="off"><select id="smsCountryPicker"></select><button id="smsAddCountryBtn" type="button" class="secondary">添加</button></span></label>
         </div>
         <div id="smsCountryList" class="country-list"></div>
         <div class="row">
@@ -1047,9 +1135,14 @@ function html(): string {
       <section class="panel stack">
         <div class="panel-head">
           <h2>日志</h2>
-          <span class="muted">实时</span>
+          <div class="row">
+            <span id="logsState" class="muted">已折叠</span>
+            <button id="toggleLogsBtn" type="button" class="secondary" aria-expanded="false">展开</button>
+          </div>
         </div>
-        <pre id="logs"></pre>
+        <div id="logsBody" hidden>
+          <pre id="logs"></pre>
+        </div>
       </section>
 
       <section class="panel stack">
@@ -1092,7 +1185,9 @@ function html(): string {
       pendingLogs: [],
       logFlushTimer: 0,
       lastLogStreamErrorAt: 0,
-      maxVisibleLogs: 600,
+      maxVisibleLogs: 300,
+      logsExpanded: false,
+      heroSmsBalanceRefreshing: false,
       configEditor: null,
       smsCountries: [],
       selectedSmsCountries: []
@@ -1128,6 +1223,86 @@ function html(): string {
 
     function setText(id, value) {
       $(id).textContent = value == null ? "" : String(value);
+    }
+
+    const workerStageLabels = {
+      idle: "空闲",
+      leasing_email: "租邮箱",
+      phone_acquire: "取号",
+      phone_signup: "手机注册",
+      phone_sms_wait: "手机 OTP",
+      phone_registered: "手机已注册",
+      oauth_start: "OAuth",
+      email_otp_wait: "邮箱 OTP",
+      oauth_exchange: "换授权",
+      success: "成功",
+      failed: "失败",
+      skipped: "跳过",
+      force_paused: "强制暂停"
+    };
+
+    const workerStatusLabels = {
+      idle: "空闲",
+      running: "运行中",
+      success: "成功",
+      failed: "失败",
+      skipped: "跳过",
+      paused: "暂停",
+      force_paused: "强停"
+    };
+
+    function formatElapsedMs(value) {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return "-";
+      const seconds = Math.floor(ms / 1000);
+      if (seconds < 60) return seconds + "s";
+      const minutes = Math.floor(seconds / 60);
+      const rest = seconds % 60;
+      if (minutes < 60) return minutes + "m" + String(rest).padStart(2, "0") + "s";
+      const hours = Math.floor(minutes / 60);
+      return hours + "h" + String(minutes % 60).padStart(2, "0") + "m";
+    }
+
+    function appendCell(row, value, className) {
+      const cell = document.createElement("td");
+      if (className) cell.className = className;
+      cell.title = value == null ? "" : String(value);
+      cell.textContent = value == null ? "" : String(value);
+      row.appendChild(cell);
+      return cell;
+    }
+
+    function renderWorkers(workers) {
+      const rows = $("workerRows");
+      rows.textContent = "";
+      const list = Array.isArray(workers) ? workers.slice().sort((a, b) => Number(a.workerId || 0) - Number(b.workerId || 0)) : [];
+      const running = list.filter((worker) => worker.status === "running").length;
+      setText("workerSummary", running + " / " + list.length + " running");
+      if (!list.length) {
+        const row = document.createElement("tr");
+        appendCell(row, "暂无线程").colSpan = 8;
+        rows.appendChild(row);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      for (const worker of list) {
+        const row = document.createElement("tr");
+        appendCell(row, worker.workerId || "-", "worker-col-id");
+        const statusCell = appendCell(row, "", "worker-col-status");
+        const pill = document.createElement("span");
+        pill.className = "worker-status " + (worker.status || "idle");
+        pill.textContent = workerStatusLabels[worker.status] || worker.status || "idle";
+        statusCell.appendChild(pill);
+        appendCell(row, workerStageLabels[worker.stage] || worker.stage || "-", "worker-col-stage");
+        appendCell(row, worker.jobId || "-", "worker-col-job");
+        appendCell(row, worker.email || "-");
+        appendCell(row, worker.phone || "-", "worker-col-phone");
+        appendCell(row, formatElapsedMs(worker.elapsedMs), "worker-col-time");
+        appendCell(row, worker.latestLog || worker.error || "-", "worker-col-log");
+        fragment.appendChild(row);
+      }
+      rows.appendChild(fragment);
     }
 
     function ensureConfigEditor() {
@@ -1198,16 +1373,31 @@ function html(): string {
       return matched ? matched.label + " #" + matched.id : "Country #" + id;
     }
 
+    function countrySearchText(country) {
+      return (String(country.label || "") + " " + String(country.id || "")).toLowerCase();
+    }
+
     function renderCountryPicker() {
       const picker = $("smsCountryPicker");
+      const query = ($("smsCountrySearch").value || "").trim().toLowerCase();
       picker.innerHTML = "";
+      let visibleCount = 0;
       for (const country of state.smsCountries) {
         if (state.selectedSmsCountries.includes(Number(country.id))) continue;
+        if (query && !countrySearchText(country).includes(query)) continue;
         const option = document.createElement("option");
         option.value = String(country.id);
         option.textContent = country.label + " #" + country.id;
         picker.appendChild(option);
+        visibleCount += 1;
       }
+      if (!visibleCount) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = query ? "无匹配国家" : "没有可添加国家";
+        picker.appendChild(option);
+      }
+      $("smsAddCountryBtn").disabled = visibleCount === 0;
     }
 
     function renderSelectedCountries() {
@@ -1298,8 +1488,8 @@ function html(): string {
         const prefix = data.countriesSource === "fallback" ? "国家列表接口失败，已用内置列表：" : "国家列表刷新失败，继续使用永久缓存：";
         setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
       }
-      renderCountryPicker();
       fillSmsForm(data.heroSMS || {});
+      renderCountryPicker();
     }
 
     function smsPayloadFromForm() {
@@ -1326,27 +1516,47 @@ function html(): string {
       $("importModal").classList.remove("open");
     }
 
+    function applyStatusData(data) {
+      state.authed = true;
+      showApp();
+      const pool = data.pool || {};
+      const runner = data.runner || {};
+      setText("countSource", pool.source || 0);
+      setText("countSuccess", pool.success || 0);
+      setText("countInflight", pool.inflight || 0);
+      setText("countFailed", pool.failed || 0);
+      updateHeroSmsBalance(data.heroSmsBalance);
+      setText("runnerStatus", runner.status || "idle");
+      renderWorkers(runner.workers || []);
+      if (data.configPath) setText("configPath", data.configPath);
+      if (data.effectiveConfig && data.effectiveConfig.run) {
+        const run = data.effectiveConfig.run;
+        const mode = run.runUntilEmpty ? "持续运行到邮箱池为空" : "固定数量";
+        setText("taskConfig", "模式 " + mode + " · total " + run.total + " · concurrency " + run.concurrency);
+      }
+    }
+
     async function refreshStatus() {
       try {
-        const data = await apiJson("/api/status");
-        state.authed = true;
-        showApp();
-        const pool = data.pool || {};
-        const runner = data.runner || {};
-        setText("countSource", pool.source || 0);
-        setText("countSuccess", pool.success || 0);
-        setText("countInflight", pool.inflight || 0);
-        setText("countFailed", pool.failed || 0);
-        updateHeroSmsBalance(data.heroSmsBalance);
-        setText("runnerStatus", runner.status || "idle");
-        if (data.configPath) setText("configPath", data.configPath);
-        if (data.effectiveConfig && data.effectiveConfig.run) {
-          const run = data.effectiveConfig.run;
-          const mode = run.runUntilEmpty ? "持续运行到邮箱池为空" : "固定数量";
-          setText("taskConfig", "模式 " + mode + " · total " + run.total + " · concurrency " + run.concurrency);
-        }
+        applyStatusData(await apiJson("/api/status"));
       } catch (error) {
         if (state.authed) setText("taskMsg", error.message);
+      }
+    }
+
+    async function refreshHeroSmsBalance() {
+      if (state.heroSmsBalanceRefreshing) return;
+      state.heroSmsBalanceRefreshing = true;
+      $("refreshHeroSmsBalanceBtn").disabled = true;
+      setText("heroSmsBalanceMeta", "刷新中");
+      try {
+        applyStatusData(await apiJson("/api/status?refreshBalance=1"));
+      } catch (error) {
+        setText("heroSmsBalance", "查询失败");
+        setText("heroSmsBalanceMeta", error.message);
+      } finally {
+        state.heroSmsBalanceRefreshing = false;
+        $("refreshHeroSmsBalanceBtn").disabled = false;
       }
     }
 
@@ -1363,26 +1573,50 @@ function html(): string {
 
     function scheduleLogFlush() {
       if (state.logFlushTimer) return;
-      state.logFlushTimer = window.setTimeout(flushLogs, 200);
+      state.logFlushTimer = window.setTimeout(flushLogs, 300);
+    }
+
+    function renderLogBox() {
+      const logBox = $("logs");
+      logBox.textContent = state.logLines.join("\\n");
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function setLogsExpanded(expanded) {
+      state.logsExpanded = Boolean(expanded);
+      $("logsBody").hidden = !state.logsExpanded;
+      $("toggleLogsBtn").textContent = state.logsExpanded ? "折叠" : "展开";
+      $("toggleLogsBtn").setAttribute("aria-expanded", String(state.logsExpanded));
+      setText("logsState", state.logsExpanded ? "实时" : "已折叠" + (state.logLines.length ? " · " + state.logLines.length + " 行" : ""));
+      if (state.logsExpanded) renderLogBox();
     }
 
     function flushLogs() {
       state.logFlushTimer = 0;
       if (!state.pendingLogs.length) return;
-      const logBox = $("logs");
-      const wasNearBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 48;
+      const logBox = state.logsExpanded ? $("logs") : null;
+      const wasNearBottom = logBox ? logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 48 : false;
       state.logLines.push(...state.pendingLogs.splice(0));
       if (state.logLines.length > state.maxVisibleLogs) {
         state.logLines.splice(0, state.logLines.length - state.maxVisibleLogs);
       }
+      if (!state.logsExpanded) {
+        setText("logsState", "已折叠 · " + state.logLines.length + " 行");
+        return;
+      }
       logBox.textContent = state.logLines.join("\\n");
-      if (wasNearBottom) {
+      if (wasNearBottom && logBox) {
         logBox.scrollTop = logBox.scrollHeight;
       }
     }
 
     function appendLog(item) {
-      state.pendingLogs.push(formatLog(item));
+      appendLogs([item]);
+    }
+
+    function appendLogs(items) {
+      if (!Array.isArray(items) || !items.length) return;
+      state.pendingLogs.push(...items.map(formatLog));
       if (state.pendingLogs.length > state.maxVisibleLogs) {
         state.pendingLogs.splice(0, state.pendingLogs.length - state.maxVisibleLogs);
       }
@@ -1396,6 +1630,11 @@ function html(): string {
       source.addEventListener("log", (event) => {
         try {
           appendLog(JSON.parse(event.data));
+        } catch {}
+      });
+      source.addEventListener("logs", (event) => {
+        try {
+          appendLogs(JSON.parse(event.data));
         } catch {}
       });
       source.addEventListener("ready", () => {
@@ -1472,12 +1711,16 @@ function html(): string {
     };
 
     $("smsPollIntervalMs").addEventListener("input", () => updateSmsPollAttemptsLabel($("smsPollIntervalMs").value));
+    $("smsCountrySearch").addEventListener("input", renderCountryPicker);
+    $("toggleLogsBtn").onclick = () => setLogsExpanded(!state.logsExpanded);
+    $("refreshHeroSmsBalanceBtn").onclick = refreshHeroSmsBalance;
     $("openImportModalBtn").onclick = openImportModal;
     $("closeImportModalBtn").onclick = closeImportModal;
     $("smsAddCountryBtn").onclick = () => {
       const id = Number($("smsCountryPicker").value);
       if (!Number.isFinite(id) || id <= 0 || state.selectedSmsCountries.includes(id)) return;
       state.selectedSmsCountries = [...state.selectedSmsCountries, id];
+      $("smsCountrySearch").value = "";
       renderSelectedCountries();
     };
     $("reloadSmsConfigBtn").onclick = async () => {

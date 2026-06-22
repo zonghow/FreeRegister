@@ -901,6 +901,10 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function shouldLogPollProgress(attempt: number, total: number, every = 10): boolean {
+  return attempt === 1 || attempt === total || attempt % every === 0;
+}
+
 function resolveCancelAndWithdrawMinAgeMs(config: HeroSmsProviderConfig): number {
   const minAgeMs =
     config.cancelAndWithdrawMinAgeMs ??
@@ -1065,15 +1069,12 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
 
       for (let attempt = 1; attempt <= pollAttempts; attempt += 1) {
         throwIfAborted(signal);
-        console.log(`[pollSMSCode]: attempt:${attempt}/${pollAttempts}`);
         // 这基于一个假设，heroSMS 不会同时有太多正在激活的 activation（小于 20），这样可以精确获取状态
         const activeActivation = await fetchActiveActivation(
           config,
           normalizedActivationId,
         );
         lastStatus = activeActivation;
-        const statusCode = activeActivation?.activationStatus
-        console.log(`[pollSMSCode]: ${statusCode === '2' ? '已收到' : '等待验证码' }`,);
         if (activeActivation) {
           const activeSnapshot =
             normalizeActiveActivationSnapshot(activeActivation);
@@ -1093,6 +1094,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
               if (shouldCompleteOnCode) {
                 await provider.completeActivation(normalizedActivationId);
               }
+              console.log(`[pollSMSCode] 收到验证码 activationId=${normalizedActivationId} attempt=${attempt}/${pollAttempts} source=${verification.source}`);
               return verification;
             }
           }
@@ -1113,6 +1115,7 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
             if (shouldCompleteOnCode) {
               await provider.completeActivation(normalizedActivationId);
             }
+            console.log(`[pollSMSCode] 收到验证码 activationId=${normalizedActivationId} attempt=${attempt}/${pollAttempts} source=${codeFromV2.source}`);
             return codeFromV2;
           }
         }
@@ -1129,8 +1132,15 @@ export function createHeroSmsProvider(config: HeroSmsProviderConfig) {
             if (shouldCompleteOnCode) {
               await provider.completeActivation(normalizedActivationId);
             }
+            console.log(`[pollSMSCode] 收到验证码 activationId=${normalizedActivationId} attempt=${attempt}/${pollAttempts} source=${codeFromStatus.source}`);
             return codeFromStatus;
           }
+        }
+
+        if (shouldLogPollProgress(attempt, pollAttempts)) {
+          console.log(
+            `[pollSMSCode] 等待验证码 activationId=${normalizedActivationId} attempt=${attempt}/${pollAttempts} status=${formatPayload(lastStatus).slice(0, 120)}`,
+          );
         }
 
         if (status === "STATUS_CANCEL") {
