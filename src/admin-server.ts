@@ -6,7 +6,7 @@ import JSZip from "jszip";
 import {EmailPool, emailFromLine} from "./email-pool.js";
 import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
-import {getHeroSmsRpsStats} from "./sms/index.js";
+import {disableHeroSmsApiKey, enableHeroSmsApiKeyIfReason, getHeroSmsRpsStats} from "./sms/index.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
 import {formatUtc8Timestamp} from "./utils.js";
 
@@ -590,6 +590,8 @@ async function fetchHeroSmsCountries(config: AppConfig): Promise<HeroSmsCountrie
         apiKey: config.heroSMS.apiKeys[0] ?? config.heroSMS.apiKey,
         proxyUrl: heroSmsProxyForWorker(config, 0),
         timeoutMs: HERO_SMS_COUNTRIES_TIMEOUT_MS,
+        rpsLimit: config.heroSMS.rpsLimit,
+        rateLimitLabel: redactHeroSmsApiKey(config.heroSMS.apiKeys[0] ?? config.heroSMS.apiKey, 0),
     });
     const countries = countryOptionsFromProvider(await provider.getCountries());
     if (!countries.length) {
@@ -674,13 +676,22 @@ async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: 
                     apiKey,
                     proxyUrl: heroSmsProxyForWorker(config, index),
                     timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
+                    rpsLimit: config.heroSMS.rpsLimit,
+                    rateLimitLabel: label,
                 });
                 const balance = await provider.getBalance();
+                if (balance.amount <= 0) {
+                    disableHeroSmsApiKey(apiKey, "no_balance", label);
+                } else {
+                    enableHeroSmsApiKeyIfReason(apiKey, "no_balance", label);
+                }
                 return {
                     ok: true,
                     index: index + 1,
                     label,
                     amount: balance.amount,
+                    disabled: balance.amount <= 0,
+                    disabledReason: balance.amount <= 0 ? "no_balance" : "",
                     raw: typeof balance.raw === "string" ? balance.raw : JSON.stringify(balance.raw),
                     fetchedAt: new Date().toISOString(),
                 };
@@ -1179,7 +1190,7 @@ function html(): string {
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric">进程内存<strong id="memoryUsed">-</strong><span id="memoryMeta" class="sub"></span></div>
         <div class="panel metric"><div class="metric-head"><span>HeroSMS 余额</span><button id="refreshHeroSmsBalanceBtn" type="button" class="icon-button" title="刷新余额" aria-label="刷新余额"><span aria-hidden="true">&#8635;</span></button></div><strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
-        <div class="panel metric"><span>HeroSMS RPS</span><strong id="heroSmsRpsTotal">0 / 0</strong><div id="heroSmsRpsList" class="sms-rps-list"></div></div>
+        <div class="panel metric"><span>HeroSMS API RPS</span><strong id="heroSmsRpsTotal">0 / 0</strong><div id="heroSmsRpsList" class="sms-rps-list"></div></div>
       </section>
 
       <section class="panel stack">
@@ -1518,7 +1529,8 @@ function html(): string {
       if (Array.isArray(balance.balances)) {
         const parts = balance.balances.map((item) => {
           if (item && item.ok && item.amount != null) {
-            return String(item.label || ("Key #" + item.index)) + ": " + formatBalanceAmount(item.amount);
+            const suffix = item.disabled ? " (停用)" : "";
+            return String(item.label || ("Key #" + item.index)) + ": " + formatBalanceAmount(item.amount) + suffix;
           }
           return String((item && item.label) || "Key") + ": 查询失败";
         });

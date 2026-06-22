@@ -3,7 +3,15 @@ import {createServer} from "node:http";
 import type {AddressInfo} from "node:net";
 import test from "node:test";
 import {HeroSmsActivationReleasedError, createHeroSmsProvider, fixedHeroSmsPollAttempts, normalizeHeroSmsBalance, normalizeHeroSmsCountries} from "../src/sms/heroSMS.js";
-import {buildHeroSmsAcquirePlan, buildHeroSmsPriceTiers, createSMSBroker, getHeroSmsRpsStats, resetHeroSmsRpsStatsForTest} from "../src/sms/index.js";
+import {
+  buildHeroSmsAcquirePlan,
+  buildHeroSmsPriceTiers,
+  createSMSBroker,
+  disableHeroSmsApiKey,
+  enableHeroSmsApiKeyIfReason,
+  getHeroSmsRpsStats,
+  resetHeroSmsRpsStatsForTest,
+} from "../src/sms/index.js";
 
 async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -325,7 +333,7 @@ test("round robin HeroSMS keys for getNumberV2 requests", async () => {
   }
 });
 
-test("fill-first HeroSMS keys until the first key hits RPS limit", async () => {
+test("fill-first HeroSMS keys until the first key hits shared account API RPS limit", async () => {
   resetHeroSmsRpsStatsForTest();
   const getNumberKeys: string[] = [];
   let nextActivation = 1;
@@ -356,7 +364,7 @@ test("fill-first HeroSMS keys until the first key hits RPS limit", async () => {
     apiKeys: ["key-a", "key-b"],
     apiKeyStrategy: "fill_first",
     rpsLimit: 2,
-    rateLimitWindowMs: 1000,
+    rateLimitWindowMs: 50,
     baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
     timeoutMs: 1000,
     countries: [33],
@@ -374,13 +382,13 @@ test("fill-first HeroSMS keys until the first key hits RPS limit", async () => {
       await broker.markAsFailed(true);
     }
 
-    assert.deepEqual(getNumberKeys, ["key-a", "key-a", "key-b"]);
+    assert.deepEqual(getNumberKeys, ["key-a", "key-b", "key-a"]);
   } finally {
     await closeServer(server);
   }
 });
 
-test("waits when all HeroSMS keys hit getNumberV2 RPS limit", async () => {
+test("waits when all HeroSMS keys hit account-level API RPS limit", async () => {
   resetHeroSmsRpsStatsForTest();
   const getNumberKeys: string[] = [];
   let nextActivation = 1;
@@ -432,6 +440,57 @@ test("waits when all HeroSMS keys hit getNumberV2 RPS limit", async () => {
 
     assert.deepEqual(getNumberKeys, ["key-a", "key-b", "key-a"]);
     assert.ok(Date.now() - startedAt >= 35);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("shares one HeroSMS account RPS window across getNumber and setStatus", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const calls: string[] = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+    calls.push(action);
+
+    if (action === "getNumberV2") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "shared-window", phoneNumber: "573570000001"}));
+      return;
+    }
+
+    if (action === "setStatus") {
+      res.end("ACCESS_READY");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const provider = createHeroSmsProvider({
+    apiKey: "shared-key",
+    rpsLimit: 1,
+    rateLimitWindowMs: 50,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+  });
+
+  try {
+    const startedAt = Date.now();
+    const activation = await provider.requestPhoneNumber({
+      service: "dr",
+      country: 33,
+      maxPrice: 0.01,
+      fixedPrice: false,
+    });
+    await provider.completeActivation(activation.activationId);
+
+    assert.deepEqual(calls, ["getNumberV2", "setStatus"]);
+    assert.ok(Date.now() - startedAt >= 35);
+    assert.equal(getHeroSmsRpsStats(["shared-key"], {rpsLimit: 1, windowMs: 50})[0].windowCount, 1);
   } finally {
     await closeServer(server);
   }
@@ -573,6 +632,91 @@ test("disables BAD_KEY HeroSMS keys for the current process", async () => {
   }
 });
 
+test("disables no-balance HeroSMS keys and continues with the next key", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const getNumberKeys: string[] = [];
+  const releaseKeys: string[] = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+    const apiKey = url.searchParams.get("api_key") ?? "";
+
+    if (action === "getNumberV2") {
+      getNumberKeys.push(apiKey);
+      if (apiKey === "empty-key") {
+        res.end("NO_BALANCE");
+        return;
+      }
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "funded-activation", phoneNumber: "573560000001"}));
+      return;
+    }
+
+    if (action === "setStatus") {
+      releaseKeys.push(apiKey);
+      res.end("ACCESS_READY");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const broker = createSMSBroker({
+    apiKeys: ["empty-key", "good-key"],
+    apiKeyStrategy: "round_robin",
+    rpsLimit: 100,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+    countries: [33],
+    acquirePriority: "country",
+    minPrice: 0.01,
+    maxPrice: 0.01,
+    priceStep: 0.01,
+    pollIntervalMs: 1,
+    autoReleaseOnTimeout: false,
+  });
+
+  try {
+    await broker.getActivation();
+    await broker.markAsFailed(true);
+
+    assert.deepEqual(getNumberKeys, ["empty-key", "good-key"]);
+    assert.deepEqual(releaseKeys, ["good-key"]);
+    assert.deepEqual(
+      getHeroSmsRpsStats(["empty-key", "good-key"], {rpsLimit: 100}).map((item) => ({
+        label: item.label,
+        disabled: item.disabled,
+        disabledReason: item.disabledReason,
+      })),
+      [
+        {label: "Key #1 ****-key", disabled: true, disabledReason: "no_balance"},
+        {label: "Key #2 ****-key", disabled: false, disabledReason: ""},
+      ],
+    );
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("re-enables only no-balance HeroSMS keys after balance refresh", () => {
+  resetHeroSmsRpsStatsForTest();
+
+  disableHeroSmsApiKey("recharge-key", "no_balance", "Key #1 ****-key");
+  assert.equal(getHeroSmsRpsStats(["recharge-key"])[0].disabled, true);
+
+  enableHeroSmsApiKeyIfReason("recharge-key", "no_balance", "Key #1 ****-key");
+  assert.equal(getHeroSmsRpsStats(["recharge-key"])[0].disabled, false);
+
+  disableHeroSmsApiKey("bad-key", "bad_key", "Key #1 ****-key");
+  enableHeroSmsApiKeyIfReason("bad-key", "no_balance", "Key #1 ****-key");
+  const stats = getHeroSmsRpsStats(["bad-key"])[0];
+  assert.equal(stats.disabled, true);
+  assert.equal(stats.disabledReason, "bad_key");
+});
+
 test("shares HeroSMS RPS stats and round-robin cursor across brokers", async () => {
   resetHeroSmsRpsStatsForTest();
   const getNumberKeys: string[] = [];
@@ -632,8 +776,8 @@ test("shares HeroSMS RPS stats and round-robin cursor across brokers", async () 
         disabled: item.disabled,
       })),
       [
-        {label: "Key #1 ****ey-a", rps: 1, windowCount: 1, disabled: false},
-        {label: "Key #2 ****ey-b", rps: 1, windowCount: 1, disabled: false},
+        {label: "Key #1 ****ey-a", rps: 2, windowCount: 2, disabled: false},
+        {label: "Key #2 ****ey-b", rps: 2, windowCount: 2, disabled: false},
       ],
     );
   } finally {

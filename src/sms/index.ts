@@ -6,6 +6,17 @@ import type {
   HeroSmsProvider,
   HeroSmsVerificationCode,
 } from "./heroSMS.js";
+import {
+  disableHeroSmsApiKey,
+  getHeroSmsApiKeyRpsSnapshot,
+  redactHeroSmsKey,
+  resetHeroSmsRpsStatsForTest as resetHeroSmsRateLimitStatsForTest,
+} from "./heroSmsRateLimit.js";
+export {
+  disableHeroSmsApiKey,
+  enableHeroSmsApiKeyIfReason,
+  getHeroSmsRpsStats,
+} from "./heroSmsRateLimit.js";
 
 export type HeroSmsApiKeyStrategy = "round_robin" | "fill_first";
 
@@ -39,29 +50,6 @@ interface KeyAccount {
   disabled: boolean;
 }
 
-const DEFAULT_RATE_LIMIT_WINDOW_MS = 1000;
-
-interface KeyRateState {
-  apiKey: string;
-  label: string;
-  requestTimestamps: number[];
-  disabled: boolean;
-  lastRequestAt: number;
-}
-
-export interface HeroSmsKeyRpsSnapshot {
-  index: number;
-  label: string;
-  rps: number;
-  rpsLimit: number;
-  windowCount: number;
-  windowMs: number;
-  waitMs: number;
-  disabled: boolean;
-  lastRequestAt: string;
-}
-
-const keyRateStates = new Map<string, KeyRateState>();
 const keySetCursors = new Map<string, number>();
 
 function roundPrice(value: number): number {
@@ -84,91 +72,48 @@ function normalizeApiKeys(apiKeys: string[]): string[] {
   return normalized;
 }
 
-function redactHeroSmsKey(apiKey: string): string {
-  const tail = apiKey.slice(-4) || "empty";
-  return `****${tail}`;
-}
-
 function isBadKeyError(error: unknown): boolean {
   return String((error as Error)?.message ?? error).toUpperCase().includes("BAD_KEY");
 }
 
-function rateStateFor(apiKey: string, label: string): KeyRateState {
-  const existing = keyRateStates.get(apiKey);
-  if (existing) {
-    existing.label = label;
-    return existing;
-  }
-  const created: KeyRateState = {
-    apiKey,
-    label,
-    requestTimestamps: [],
-    disabled: false,
-    lastRequestAt: 0,
-  };
-  keyRateStates.set(apiKey, created);
-  return created;
+function isInsufficientBalanceError(error: unknown): boolean {
+  const message = String((error as Error)?.message ?? error).toUpperCase();
+  return (
+    message.includes("NO_BALANCE") ||
+    message.includes("NO_MONEY") ||
+    message.includes("NO_FUNDS") ||
+    message.includes("LOW_BALANCE") ||
+    message.includes("ZERO_BALANCE") ||
+    message.includes("EMPTY_BALANCE") ||
+    message.includes("NOT_ENOUGH") ||
+    message.includes("NOT ENOUGH") ||
+    message.includes("INSUFFICIENT_BALANCE") ||
+    message.includes("INSUFFICIENT FUNDS") ||
+    message.includes("INSUFFICIENT_FUNDS") ||
+    (message.includes("INSUFFICIENT") && (message.includes("BALANCE") || message.includes("FUNDS") || message.includes("MONEY")))
+  );
 }
 
-function pruneRateWindow(state: KeyRateState, now: number, windowMs: number): void {
-  while (state.requestTimestamps.length && now - state.requestTimestamps[0] >= windowMs) {
-    state.requestTimestamps.shift();
-  }
-}
-
-function stateWaitMs(state: KeyRateState, now: number, windowMs: number): number {
-  pruneRateWindow(state, now, windowMs);
-  const oldest = state.requestTimestamps[0];
-  return oldest == null ? 1 : Math.max(1, windowMs - (now - oldest));
+function keyDisableReasonForError(error: unknown): string {
+  if (isBadKeyError(error)) return "bad_key";
+  if (isInsufficientBalanceError(error)) return "no_balance";
+  return "";
 }
 
 function normalizeRateLimitWindowMs(value?: number): number {
-  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : DEFAULT_RATE_LIMIT_WINDOW_MS;
-}
-
-function normalizeRpsLimit(value?: number): number {
-  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : 40;
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : 1000;
 }
 
 function keySetId(apiKeys: string[]): string {
   return apiKeys.join("\0");
 }
 
-function accountRateState(account: KeyAccount): KeyRateState {
-  return rateStateFor(account.apiKey, account.label);
-}
-
-export function getHeroSmsRpsStats(
-  apiKeys: string[],
-  options: {rpsLimit?: number; windowMs?: number} = {},
-): HeroSmsKeyRpsSnapshot[] {
-  const normalizedApiKeys = normalizeApiKeys(apiKeys);
-  const rpsLimit = normalizeRpsLimit(options.rpsLimit);
-  const windowMs = normalizeRateLimitWindowMs(options.windowMs);
-  const now = Date.now();
-
-  return normalizedApiKeys.map((apiKey, index): HeroSmsKeyRpsSnapshot => {
-    const label = `Key #${index + 1} ${redactHeroSmsKey(apiKey)}`;
-    const state = rateStateFor(apiKey, label);
-    pruneRateWindow(state, now, windowMs);
-    const windowCount = state.requestTimestamps.length;
-    const rps = Math.round((windowCount * 1000 / windowMs) * 100) / 100;
-    return {
-      index: index + 1,
-      label,
-      rps,
-      rpsLimit,
-      windowCount,
-      windowMs,
-      waitMs: windowCount >= rpsLimit ? stateWaitMs(state, now, windowMs) : 0,
-      disabled: state.disabled,
-      lastRequestAt: state.lastRequestAt > 0 ? new Date(state.lastRequestAt).toISOString() : "",
-    };
-  });
+function accountRateSnapshot(account: KeyAccount, rpsLimit: number, windowMs: number) {
+  return getHeroSmsApiKeyRpsSnapshot(account.apiKey, account.label, {rpsLimit, windowMs});
 }
 
 export function resetHeroSmsRpsStatsForTest(): void {
-  keyRateStates.clear();
+  resetHeroSmsRateLimitStatsForTest();
   keySetCursors.clear();
 }
 
@@ -233,6 +178,9 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
       proxyUrl: option.proxyUrl,
       baseUrl: option.baseUrl,
       timeoutMs: option.timeoutMs,
+      rpsLimit,
+      rateLimitWindowMs,
+      rateLimitLabel: `Key #${index + 1} ${redactHeroSmsKey(apiKey)}`,
       defaultRequestOptions: {
         service: "dr",
         country: countries[0],
@@ -250,7 +198,7 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
   }));
 
   function activeAccounts(): KeyAccount[] {
-    return accounts.filter((account) => !account.disabled && !accountRateState(account).disabled);
+    return accounts.filter((account) => !account.disabled && !accountRateSnapshot(account, rpsLimit, rateLimitWindowMs).disabled);
   }
 
   async function selectAccount(): Promise<KeyAccount> {
@@ -260,20 +208,12 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
         throw new Error("HeroSMS 所有 API key 均不可用");
       }
 
-      const now = Date.now();
-      for (const account of availableAccounts) {
-        pruneRateWindow(accountRateState(account), now, rateLimitWindowMs);
-      }
-
       if (option.apiKeyStrategy === "fill_first") {
         const selected = accounts.find((account) => {
-          const state = accountRateState(account);
-          return !account.disabled && !state.disabled && state.requestTimestamps.length < rpsLimit;
+          const snapshot = accountRateSnapshot(account, rpsLimit, rateLimitWindowMs);
+          return !account.disabled && !snapshot.disabled && snapshot.windowCount < rpsLimit;
         });
         if (selected) {
-          const state = accountRateState(selected);
-          state.requestTimestamps.push(now);
-          state.lastRequestAt = now;
           return selected;
         }
       } else {
@@ -282,19 +222,17 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
           const index = (cursor + offset) % accounts.length;
           const selected = accounts[index];
           if (!selected) continue;
-          const state = accountRateState(selected);
-          if (selected.disabled || state.disabled || state.requestTimestamps.length >= rpsLimit) continue;
+          const snapshot = accountRateSnapshot(selected, rpsLimit, rateLimitWindowMs);
+          if (selected.disabled || snapshot.disabled || snapshot.windowCount >= rpsLimit) continue;
           keySetCursors.set(selectionKey, (index + 1) % accounts.length);
-          state.requestTimestamps.push(now);
-          state.lastRequestAt = now;
           return selected;
         }
       }
 
       const waitMs = Math.min(
-        ...availableAccounts.map((account) => stateWaitMs(accountRateState(account), now, rateLimitWindowMs)),
+        ...availableAccounts.map((account) => accountRateSnapshot(account, rpsLimit, rateLimitWindowMs).waitMs || 1),
       );
-      console.warn(`[heroSMS] 所有 API key 均达到 getNumberV2 RPS 限制，等待 ${waitMs}ms`);
+      console.warn(`[heroSMS] 所有 API key 均达到账号级 API RPS 限制，等待 ${waitMs}ms`);
       await sleep(waitMs);
     }
   }
@@ -319,12 +257,14 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
         return activation;
       } catch (error) {
         lastErr = error;
-        if (!isBadKeyError(error)) {
+        const disableReason = keyDisableReasonForError(error);
+        if (!disableReason) {
           throw error;
         }
         account.disabled = true;
-        accountRateState(account).disabled = true;
-        console.warn(`[heroSMS] ${account.label} 返回 BAD_KEY，已在当前进程停用`);
+        disableHeroSmsApiKey(account.apiKey, disableReason, account.label);
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[heroSMS] ${account.label} 返回 ${disableReason}，已在当前进程停用 (${message.slice(0, 100)})`);
         if (!activeAccounts().length) {
           throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
         }
@@ -360,7 +300,8 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
             msg.includes("NO_NUMBER") ||
             msg.includes("BAD_PRICE") ||
             msg.includes("WRONG_MAX_PRICE") ||
-            msg.includes("BAD_KEY")
+            msg.includes("BAD_KEY") ||
+            isInsufficientBalanceError(err)
           ) {
             console.warn(`[heroSMS] country=${candidate.country} maxPrice=${candidate.maxPrice} 跳过 (${(err as Error).message.slice(0, 80)})`);
             continue;
