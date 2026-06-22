@@ -291,6 +291,11 @@ function sendJson(res: ServerResponse, statusCode: number, data: JsonValue): voi
     send(res, statusCode, JSON.stringify(data), {"content-type": "application/json; charset=utf-8"});
 }
 
+function isRunnerBusy(): boolean {
+    const snapshot = runner.getSnapshot();
+    return snapshot.activeWorkers > 0 || snapshot.status === "running" || snapshot.status === "pausing" || snapshot.status === "force_pausing";
+}
+
 function sendError(res: ServerResponse, statusCode: number, message: string): void {
     sendJson(res, statusCode, {ok: false, error: message});
 }
@@ -924,6 +929,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         return;
     }
 
+    if (pathname === "/api/email/inflight/return" && req.method === "POST") {
+        if (isRunnerBusy()) {
+            sendError(res, 409, "任务运行中，不能操作进行中邮箱");
+            return;
+        }
+        const pool = new EmailPool(loadConfig().emailPool);
+        const result = await pool.returnInflightToSource();
+        logger.info(`[admin] 进行中邮箱已归还到待使用 count=${result.returned}`);
+        sendJson(res, 200, {ok: true, result: result as unknown as JsonValue});
+        return;
+    }
+
+    if (pathname === "/api/email/inflight/fail" && req.method === "POST") {
+        if (isRunnerBusy()) {
+            sendError(res, 409, "任务运行中，不能操作进行中邮箱");
+            return;
+        }
+        const pool = new EmailPool(loadConfig().emailPool);
+        const result = await pool.markInflightFailed("admin_mark_inflight_failed");
+        logger.warn(`[admin] 进行中邮箱已标记失败 failed=${result.failed} cleared=${result.cleared}`);
+        sendJson(res, 200, {ok: true, result: result as unknown as JsonValue});
+        return;
+    }
+
     if (pathname === "/api/task/start" && req.method === "POST") {
         const config = loadConfig();
         const snapshot = runner.start(config);
@@ -969,6 +998,8 @@ function html(): string {
     .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .metric-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
+    .metric-actions button { height: 24px; padding: 0 7px; font-size: 11px; }
     .icon-button { width: 24px; height: 24px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-color: var(--line); background: #fff; color: var(--text); line-height: 1; }
     .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -1059,7 +1090,7 @@ function html(): string {
       <section class="grid">
         <div class="panel metric">待使用<strong id="countSource">0</strong></div>
         <div class="panel metric">成功<strong id="countSuccess">0</strong></div>
-        <div class="panel metric">进行中<strong id="countInflight">0</strong></div>
+        <div class="panel metric"><span>进行中</span><strong id="countInflight">0</strong><div class="metric-actions"><button id="returnInflightBtn" type="button" class="secondary">归还</button><button id="failInflightBtn" type="button" class="secondary">标失败</button></div></div>
         <div class="panel metric">失败<strong id="countFailed">0</strong></div>
         <div class="panel metric"><div class="metric-head"><span>HeroSMS 余额</span><button id="refreshHeroSmsBalanceBtn" type="button" class="icon-button" title="刷新余额" aria-label="刷新余额"><span aria-hidden="true">&#8635;</span></button></div><strong id="heroSmsBalance">-</strong><span id="heroSmsBalanceMeta" class="sub"></span></div>
       </section>
@@ -1188,6 +1219,8 @@ function html(): string {
       maxVisibleLogs: 300,
       logsExpanded: false,
       heroSmsBalanceRefreshing: false,
+      inflightCount: 0,
+      runnerBusy: false,
       configEditor: null,
       smsCountries: [],
       selectedSmsCountries: []
@@ -1521,10 +1554,13 @@ function html(): string {
       showApp();
       const pool = data.pool || {};
       const runner = data.runner || {};
+      state.inflightCount = Number(pool.inflight || 0);
+      state.runnerBusy = runner.status === "running" || runner.status === "pausing" || runner.status === "force_pausing" || Number(runner.activeWorkers || 0) > 0;
       setText("countSource", pool.source || 0);
       setText("countSuccess", pool.success || 0);
-      setText("countInflight", pool.inflight || 0);
+      setText("countInflight", state.inflightCount);
       setText("countFailed", pool.failed || 0);
+      updateInflightButtons();
       updateHeroSmsBalance(data.heroSmsBalance);
       setText("runnerStatus", runner.status || "idle");
       renderWorkers(runner.workers || []);
@@ -1534,6 +1570,14 @@ function html(): string {
         const mode = run.runUntilEmpty ? "持续运行到邮箱池为空" : "固定数量";
         setText("taskConfig", "模式 " + mode + " · total " + run.total + " · concurrency " + run.concurrency);
       }
+    }
+
+    function updateInflightButtons() {
+      const disabled = state.runnerBusy || state.inflightCount <= 0;
+      $("returnInflightBtn").disabled = disabled;
+      $("failInflightBtn").disabled = disabled;
+      $("returnInflightBtn").title = state.runnerBusy ? "任务运行中不能操作" : "归还进行中邮箱到待使用";
+      $("failInflightBtn").title = state.runnerBusy ? "任务运行中不能操作" : "标记进行中邮箱为失败";
     }
 
     async function refreshStatus() {
@@ -1557,6 +1601,29 @@ function html(): string {
       } finally {
         state.heroSmsBalanceRefreshing = false;
         $("refreshHeroSmsBalanceBtn").disabled = false;
+      }
+    }
+
+    async function mutateInflight(path, confirmMessage, doneMessage) {
+      if (state.runnerBusy) {
+        setText("taskMsg", "任务运行中，不能操作进行中邮箱");
+        return;
+      }
+      if (state.inflightCount <= 0) {
+        setText("taskMsg", "没有进行中邮箱");
+        return;
+      }
+      if (!window.confirm(confirmMessage.replace("{count}", String(state.inflightCount)))) return;
+      $("returnInflightBtn").disabled = true;
+      $("failInflightBtn").disabled = true;
+      try {
+        const data = await apiJson(path, {method: "POST", body: "{}"});
+        const result = data.result || {};
+        setText("taskMsg", doneMessage(result));
+        await refreshStatus();
+      } catch (error) {
+        setText("taskMsg", error.message);
+        await refreshStatus();
       }
     }
 
@@ -1709,6 +1776,18 @@ function html(): string {
         setText("taskMsg", error.message);
       }
     };
+
+    $("returnInflightBtn").onclick = () => mutateInflight(
+      "/api/email/inflight/return",
+      "确认把 {count} 个进行中邮箱归还到待使用？",
+      (result) => "已归还进行中邮箱 " + (result.returned || 0) + " 个",
+    );
+
+    $("failInflightBtn").onclick = () => mutateInflight(
+      "/api/email/inflight/fail",
+      "确认把 {count} 个进行中邮箱标记为失败？",
+      (result) => "已标记失败 " + (result.failed || 0) + " 个，清理进行中 " + (result.cleared || 0) + " 个",
+    );
 
     $("smsPollIntervalMs").addEventListener("input", () => updateSmsPollAttemptsLabel($("smsPollIntervalMs").value));
     $("smsCountrySearch").addEventListener("input", renderCountryPicker);

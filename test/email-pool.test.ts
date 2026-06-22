@@ -100,6 +100,40 @@ test("post-oauth uncertainty moves lease to failed once", async () => {
     }
 });
 
+test("returns all orphan inflight emails to source", async () => {
+    const {dir, pool} = await makeTempPool();
+    try {
+        await writeFile(path.join(dir, "email.txt"), fakeLine(10) + "\n");
+        await writeFile(path.join(dir, "email.inflight.txt"), fakeLine(1) + "\n" + fakeLine(2) + "\n");
+
+        const result = await pool.returnInflightToSource();
+
+        assert.deepEqual(result, {returned: 2});
+        assert.deepEqual(await lines(path.join(dir, "email.txt")), [fakeLine(1), fakeLine(2), fakeLine(10)]);
+        assert.deepEqual(await lines(path.join(dir, "email.inflight.txt")), []);
+    } finally {
+        await rm(dir, {recursive: true, force: true});
+    }
+});
+
+test("marks all orphan inflight emails as failed", async () => {
+    const {dir, pool} = await makeTempPool();
+    try {
+        await writeFile(path.join(dir, "email.txt"), fakeLine(10) + "\n");
+        await writeFile(path.join(dir, "email.inflight.txt"), fakeLine(1) + "\n" + fakeLine(2) + "\n");
+        await writeFile(path.join(dir, "email.failed.txt"), "# old failure\n" + fakeLine(2) + "\n");
+
+        const result = await pool.markInflightFailed("admin test");
+
+        assert.deepEqual(result, {failed: 1, cleared: 2});
+        assert.deepEqual(await lines(path.join(dir, "email.txt")), [fakeLine(10)]);
+        assert.deepEqual(await lines(path.join(dir, "email.inflight.txt")), []);
+        assert.deepEqual(await lines(path.join(dir, "email.failed.txt")), [fakeLine(2), fakeLine(1)]);
+    } finally {
+        await rm(dir, {recursive: true, force: true});
+    }
+});
+
 test("imports unique valid emails to source", async () => {
     const {dir, pool} = await makeTempPool();
     try {

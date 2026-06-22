@@ -32,6 +32,15 @@ export interface ImportEmailsResult {
     total: number;
 }
 
+export interface InflightReturnResult {
+    returned: number;
+}
+
+export interface InflightFailResult {
+    failed: number;
+    cleared: number;
+}
+
 export class EmailPool {
     readonly paths: EmailPoolPaths;
 
@@ -196,6 +205,50 @@ export class EmailPool {
                 this.paths.success,
                 successLines.filter((line) => !targets.has(emailFromLine(line))),
             );
+        });
+    }
+
+    async returnInflightToSource(): Promise<InflightReturnResult> {
+        return this.withLock(async () => {
+            const inflightLines = await readPoolLines(this.paths.inflight);
+            if (!inflightLines.length) {
+                return {returned: 0};
+            }
+
+            let sourceLines = await readPoolLines(this.paths.source);
+            for (const line of [...inflightLines].reverse()) {
+                sourceLines = prependUniqueByEmail(sourceLines, line);
+            }
+            await writePoolLinesAtomic(this.paths.source, sourceLines);
+            await writePoolLinesAtomic(this.paths.inflight, []);
+            return {returned: inflightLines.length};
+        });
+    }
+
+    async markInflightFailed(reason: string): Promise<InflightFailResult> {
+        return this.withLock(async () => {
+            const inflightLines = await readPoolLines(this.paths.inflight);
+            if (!inflightLines.length) {
+                return {failed: 0, cleared: 0};
+            }
+
+            const failedRaw = await readRawFile(this.paths.failed);
+            const failedLines = splitLines(failedRaw);
+            const nextFailedLines = [...failedLines];
+            let failed = 0;
+            const normalizedReason = reason.replace(/\s+/g, " ").slice(0, 240);
+            for (const line of inflightLines) {
+                const email = emailFromLine(line);
+                if (!email || hasEmail(nextFailedLines, email)) {
+                    continue;
+                }
+                nextFailedLines.push(`# failed at ${new Date().toISOString()} reason=${normalizedReason}`, line);
+                failed += 1;
+            }
+
+            await writeRawFileAtomic(this.paths.failed, ensureTrailingNewline(nextFailedLines.join("\n")));
+            await writePoolLinesAtomic(this.paths.inflight, []);
+            return {failed, cleared: inflightLines.length};
         });
     }
 
