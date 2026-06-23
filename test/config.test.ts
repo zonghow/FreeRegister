@@ -17,7 +17,11 @@ adaptive_target_sms_rps_utilization = 0.95
 adaptive_control_interval_ms = 2000
 
 [proxies]
+mode = "phone_country"
 urls = ["socks5://a", "http://b"]
+phone_country_template = "socks5://user-region-{code}-sid-{sid}:pass@example.com:3010"
+country_code_url = "https://example.com/country_code.json"
+country_code_cache = ".cache/custom-country-code.json"
 
 [hero_sms]
 countries = [33, 52]
@@ -40,7 +44,11 @@ auto_release_on_timeout = true
     assert.equal(parsed.run.run_until_empty, true);
     assert.equal(parsed.run.adaptive_target_sms_rps_utilization, 0.95);
     assert.equal(parsed.run.adaptive_control_interval_ms, 2000);
+    assert.equal(parsed.proxies.mode, "phone_country");
     assert.deepEqual(parsed.proxies.urls, ["socks5://a", "http://b"]);
+    assert.equal(parsed.proxies.phone_country_template, "socks5://user-region-{code}-sid-{sid}:pass@example.com:3010");
+    assert.equal(parsed.proxies.country_code_url, "https://example.com/country_code.json");
+    assert.equal(parsed.proxies.country_code_cache, ".cache/custom-country-code.json");
     assert.deepEqual(parsed.hero_sms.countries, [33, 52]);
     assert.equal(parsed.hero_sms.acquire_priority, "price_high");
     assert.deepEqual(parsed.hero_sms.api_keys, ["hero-a", "hero-b"]);
@@ -89,7 +97,11 @@ max_phone_tries = 9
 auto_release_on_timeout = false
 
 [proxies]
+mode = "phone_country"
 urls = ["socks5://one", "socks5://two"]
+phone_country_template = "socks5://user-region-{code}-sid-{sid}:pass@example.com:3010"
+country_code_url = "https://example.com/country_code.json"
+country_code_cache = ".cache/custom-country-code.json"
 
 [cpa_json]
 dir = "custom-cpa"
@@ -143,6 +155,11 @@ file = "custom-sdk.js"
         assert.equal(heroSmsProxyForWorker(overridden, 2), "socks5://hero-one");
         assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "proxies"}}, 1), "socks5://two");
         assert.equal(heroSmsProxyForWorker({...overridden, heroSMS: {...overridden.heroSMS, proxyStrategy: "direct"}}, 0), "");
+        assert.equal(overridden.proxy.mode, "phone_country");
+        assert.deepEqual(overridden.proxy.urls, ["socks5://one", "socks5://two"]);
+        assert.equal(overridden.proxy.phoneCountryTemplate, "socks5://user-region-{code}-sid-{sid}:pass@example.com:3010");
+        assert.equal(overridden.proxy.countryCodeUrl, "https://example.com/country_code.json");
+        assert.equal(overridden.proxy.countryCodeCache, path.join(dir, ".cache/custom-country-code.json"));
         assert.equal(overridden.cpaJson.dir, path.join(dir, "custom-cpa"));
         assert.equal(overridden.cost.emailUnitCost, 0.07);
         assert.equal(overridden.cost.currency, "USD");
@@ -190,6 +207,9 @@ adaptive_target_sms_rps_utilization = 5
 [hero_sms]
 api_key = "legacy-key"
 api_key_strategy = "surprise"
+
+[proxies]
+mode = "surprise"
 `);
 
         const loaded = loadConfig(configPath);
@@ -201,6 +221,7 @@ api_key_strategy = "surprise"
         assert.deepEqual(loaded.heroSMS.apiKeys, ["legacy-key"]);
         assert.equal(loaded.heroSMS.apiKeyStrategy, "round_robin");
         assert.equal(loaded.heroSMS.rpsLimit, 40);
+        assert.equal(loaded.proxy.mode, "pool");
     } finally {
         await rm(dir, {recursive: true, force: true});
     }

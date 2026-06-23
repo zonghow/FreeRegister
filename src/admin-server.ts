@@ -5,10 +5,11 @@ import path from "node:path";
 import JSZip from "jszip";
 import {removeSuccessCostRecords, successCostLinesForEmails, summarizeSuccessCosts} from "./cost.js";
 import {EmailPool, emailFromLine} from "./email-pool.js";
-import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy} from "./config.js";
+import {heroSmsProxyForWorker, loadConfig, parseToml, redactProxy, type AppConfig, type HeroSMSConfig, type HeroSMSProxyStrategy, type ProxyMode} from "./config.js";
 import {RegisterTaskRunner, type RegisterLogger} from "./runner.js";
 import {disableHeroSmsApiKey, enableHeroSmsApiKeyIfReason, getHeroSmsRpsStats} from "./sms/index.js";
 import {createHeroSmsProvider, fixedHeroSmsPollAttempts, type HeroSmsCountry} from "./sms/heroSMS.js";
+import {extractHeroSmsCountryName} from "./phone-country-proxy.js";
 import {formatUtc8Timestamp} from "./utils.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | {[key: string]: JsonValue};
@@ -24,6 +25,7 @@ interface LogEntry {
 interface HeroSmsCountryOption {
     id: number;
     label: string;
+    english?: string;
 }
 
 interface HeroSmsCountriesStatus {
@@ -585,9 +587,20 @@ function runConcurrencyModeFromBody(value: unknown, fallback: AppConfig["run"]["
     return fallback;
 }
 
+function proxyModeFromBody(value: unknown, fallback: ProxyMode): ProxyMode {
+    const normalized = String(value ?? "").trim();
+    if (normalized === "pool" || normalized === "phone_country") return normalized;
+    return fallback;
+}
+
 function publicConfigSummary(config: AppConfig): JsonValue {
     return {
         run: config.run as unknown as JsonValue,
+        proxy: {
+            ...config.proxy,
+            urls: config.proxy.urls.map(redactProxy),
+            phoneCountryTemplate: config.proxy.phoneCountryTemplate,
+        } as unknown as JsonValue,
         proxies: config.proxies.map(redactProxy),
         emailPool: config.emailPool as unknown as JsonValue,
         cpaJson: config.cpaJson as unknown as JsonValue,
@@ -619,6 +632,7 @@ function countryOptionsFromProvider(countries: HeroSmsCountry[]): HeroSmsCountry
         options.push({
             id,
             label,
+            english: extractHeroSmsCountryName(country) || undefined,
         });
     }
     return options;
@@ -635,7 +649,8 @@ function countryOptionsFromUnknown(value: unknown): HeroSmsCountryOption[] {
         if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
         seen.add(id);
         const label = String(record.label || "").trim() || `Country #${id}`;
-        options.push({id, label});
+        const english = String(record.english || "").trim();
+        options.push({id, label, ...(english ? {english} : {})});
     }
     return options;
 }
@@ -1069,6 +1084,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         sendJson(res, 200, {
             ok: true,
             run: config.run as unknown as JsonValue,
+            proxy: config.proxy as unknown as JsonValue,
             heroSMS: smsConfigJson(config),
             countries: mergeSelectedCountries(countryStatus.countries, config.heroSMS.countries) as unknown as JsonValue,
             countriesSource: countryStatus.source,
@@ -1089,6 +1105,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const runValues = {
             concurrency_mode: runConcurrencyModeFromBody(body.concurrencyMode, config.run.concurrencyMode),
         };
+        const proxyValues = {
+            mode: proxyModeFromBody(body.proxyMode, config.proxy.mode),
+            phone_country_template: typeof body.phoneCountryTemplate === "string" && body.phoneCountryTemplate.trim()
+                ? body.phoneCountryTemplate.trim()
+                : config.proxy.phoneCountryTemplate,
+        };
         const values = {
             proxy_strategy: proxyStrategyFromBody(body.proxyStrategy, hero.proxyStrategy),
             api_key_strategy: apiKeyStrategyFromBody(body.apiKeyStrategy, hero.apiKeyStrategy),
@@ -1107,7 +1129,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         const nextContent = upsertTomlSection(
-            upsertTomlSection(content, "run", runValues),
+            upsertTomlSection(
+                upsertTomlSection(content, "run", runValues),
+                "proxies",
+                proxyValues,
+            ),
             "hero_sms",
             values,
             ["country", "price_tiers", "poll_attempts", "use_proxy"],
@@ -1382,6 +1408,11 @@ function html(): string {
             <option value="fixed">fixed</option>
             <option value="adaptive">adaptive</option>
           </select></label>
+          <label><span>注册代理模式</span><select id="proxyMode">
+            <option value="pool">代理池</option>
+            <option value="phone_country">手机号国家</option>
+          </select></label>
+          <label class="proxy-field"><span>手机号国家代理模板</span><input id="phoneCountryTemplate" placeholder="socks5://...-region-{code}-sid-{sid}-..."></label>
         </div>
       </section>
 
@@ -1485,6 +1516,7 @@ function html(): string {
       heroSmsBalanceRefreshing: false,
       inflightCount: 0,
       runnerBusy: false,
+      smsConfigDirty: false,
       configEditor: null,
       smsCountries: [],
       selectedSmsCountries: []
@@ -1822,6 +1854,7 @@ function html(): string {
         up.setAttribute("aria-label", "上移");
         up.disabled = index === 0;
         up.onclick = () => {
+          markSmsConfigDirty();
           const next = [...state.selectedSmsCountries];
           [next[index - 1], next[index]] = [next[index], next[index - 1]];
           state.selectedSmsCountries = next;
@@ -1834,6 +1867,7 @@ function html(): string {
         down.setAttribute("aria-label", "下移");
         down.disabled = index === state.selectedSmsCountries.length - 1;
         down.onclick = () => {
+          markSmsConfigDirty();
           const next = [...state.selectedSmsCountries];
           [next[index], next[index + 1]] = [next[index + 1], next[index]];
           state.selectedSmsCountries = next;
@@ -1845,6 +1879,7 @@ function html(): string {
         remove.title = "删除";
         remove.setAttribute("aria-label", "删除");
         remove.onclick = () => {
+          markSmsConfigDirty();
           state.selectedSmsCountries = state.selectedSmsCountries.filter((item) => item !== id);
           renderCountryPicker();
           renderSelectedCountries();
@@ -1866,6 +1901,20 @@ function html(): string {
         return hero.proxyStrategy;
       }
       return hero && hero.useProxy === true ? "proxies" : "direct";
+    }
+
+    function normalizeProxyMode(proxy) {
+      return proxy && proxy.mode === "phone_country" ? "phone_country" : "pool";
+    }
+
+    function fillProxyForm(proxy) {
+      $("proxyMode").value = normalizeProxyMode(proxy);
+      setInputValue("phoneCountryTemplate", proxy && proxy.phoneCountryTemplate || "");
+    }
+
+    function markSmsConfigDirty() {
+      state.smsConfigDirty = true;
+      setText("smsConfigMsg", "有未保存改动");
     }
 
     function fillSmsForm(hero) {
@@ -1891,13 +1940,17 @@ function html(): string {
         setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
       }
       if (data.run) $("runConcurrencyMode").value = data.run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+      fillProxyForm(data.proxy || {});
       fillSmsForm(data.heroSMS || {});
+      state.smsConfigDirty = false;
       renderCountryPicker();
     }
 
     function smsPayloadFromForm() {
       return {
         concurrencyMode: $("runConcurrencyMode").value,
+        proxyMode: $("proxyMode").value,
+        phoneCountryTemplate: $("phoneCountryTemplate").value,
         countries: state.selectedSmsCountries,
         apiKeyStrategy: $("smsApiKeyStrategy").value,
         acquirePriority: $("smsAcquirePriority").value,
@@ -1941,10 +1994,15 @@ function html(): string {
       if (data.configPath) setText("configPath", data.configPath);
       if (data.effectiveConfig && data.effectiveConfig.run) {
         const run = data.effectiveConfig.run;
+        const proxy = data.effectiveConfig.proxy || {};
         const mode = run.runUntilEmpty ? "持续运行到邮箱池为空" : "固定数量";
         const concurrencyMode = (runner.concurrencyMode || run.concurrencyMode) === "adaptive" ? "adaptive" : "fixed";
-        $("runConcurrencyMode").value = run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
-        const parts = ["模式 " + mode, "并发 " + concurrencyMode, "total " + run.total, "concurrency " + run.concurrency];
+        if (!state.smsConfigDirty) {
+          $("runConcurrencyMode").value = run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+          fillProxyForm(proxy);
+        }
+        const proxyMode = normalizeProxyMode(proxy) === "phone_country" ? "手机号国家代理" : "代理池";
+        const parts = ["模式 " + mode, "并发 " + concurrencyMode, "注册代理 " + proxyMode, "total " + run.total, "concurrency " + run.concurrency];
         if (concurrencyMode === "adaptive") {
           parts.push("worker " + Number(runner.currentConcurrency || 0) + "/" + Number(runner.targetConcurrency || 0) + "/max " + Number(runner.maxConcurrency || 0));
           parts.push("HeroSMS " + formatRpsAmount(runner.adaptiveSmsRps || 0) + "/" + Number(runner.adaptiveSmsRpsLimit || 0) + " target " + formatPercent(runner.adaptiveTargetSmsRpsUtilization || run.adaptiveTargetSmsRpsUtilization || 0));
@@ -2214,6 +2272,10 @@ function html(): string {
       (result) => "已标记失败 " + (result.failed || 0) + " 个，清理进行中 " + (result.cleared || 0) + " 个",
     );
 
+    ["runConcurrencyMode", "proxyMode", "phoneCountryTemplate", "smsProxyStrategy", "smsApiKeyStrategy", "smsAcquirePriority", "smsMinPrice", "smsMaxPrice", "smsPriceStep", "smsMaxPhoneTries"].forEach((id) => {
+      $(id).addEventListener("input", markSmsConfigDirty);
+      $(id).addEventListener("change", markSmsConfigDirty);
+    });
     $("smsCountrySearch").addEventListener("input", renderCountryPicker);
     $("logs").addEventListener("scroll", updateLogFollowTail, {passive: true});
     $("copyLogsBtn").onclick = copyVisibleLogs;
@@ -2224,6 +2286,7 @@ function html(): string {
     $("smsAddCountryBtn").onclick = () => {
       const id = Number($("smsCountryPicker").value);
       if (!Number.isFinite(id) || id <= 0 || state.selectedSmsCountries.includes(id)) return;
+      markSmsConfigDirty();
       state.selectedSmsCountries = [...state.selectedSmsCountries, id];
       $("smsCountrySearch").value = "";
       renderSelectedCountries();
@@ -2231,6 +2294,7 @@ function html(): string {
     $("reloadSmsConfigBtn").onclick = async () => {
       try {
         await loadSmsConfig(true);
+        state.smsConfigDirty = false;
         setText("smsConfigMsg", "已重新加载");
       } catch (error) {
         setText("smsConfigMsg", error.message);
@@ -2239,6 +2303,7 @@ function html(): string {
     $("saveSmsConfigBtn").onclick = async () => {
       try {
         await apiJson("/api/sms-config", {method: "PUT", body: JSON.stringify(smsPayloadFromForm())});
+        state.smsConfigDirty = false;
         await Promise.all([refreshStatus(), loadConfig(), loadSmsConfig()]);
         setText("smsConfigMsg", "已保存");
       } catch (error) {
@@ -2343,6 +2408,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
 }
 
+function installShutdownHandlers(server: ReturnType<typeof createServer>): void {
+    let shuttingDown = false;
+    const shutdown = (signal: NodeJS.Signals, exitCode: number): void => {
+        if (shuttingDown) {
+            process.exit(exitCode);
+        }
+        shuttingDown = true;
+        logger.warn(`[admin] 收到 ${signal}，强制暂停任务并退出`);
+        runner.forcePause();
+        server.close((error) => {
+            if (error) {
+                logger.error(`[admin] 关闭 HTTP 服务失败: ${error.message}`);
+            }
+        });
+        const forceExitTimer = setTimeout(() => {
+            logger.error(`[admin] ${signal} 后等待任务退出超时，强制退出`);
+            process.exit(exitCode);
+        }, 9000);
+        forceExitTimer.unref?.();
+        void runner.wait().finally(() => {
+            clearTimeout(forceExitTimer);
+            process.exit(exitCode);
+        });
+    };
+
+    process.once("SIGINT", () => shutdown("SIGINT", 130));
+    process.once("SIGTERM", () => shutdown("SIGTERM", 143));
+}
+
 async function main(): Promise<void> {
     installConsoleCapture();
     await loadPersistentSessions();
@@ -2353,6 +2447,7 @@ async function main(): Promise<void> {
     const server = createServer((req, res) => {
         void handleRequest(req, res);
     });
+    installShutdownHandlers(server);
     server.listen(port, "0.0.0.0", () => {
         logger.info(`[admin] listening on http://0.0.0.0:${port}`);
     });

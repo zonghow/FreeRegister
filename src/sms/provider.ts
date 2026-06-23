@@ -4,6 +4,10 @@ export interface SmsActivation {
   expiresAt?: Date;
   canRequestAnotherSms?: boolean;
   activationCost?: number;
+  requestCountry?: number;
+  requestCountryLabel?: string;
+  requestCountryName?: string;
+  requestMaxPrice?: number;
 }
 
 export interface SmsVerificationCode {

@@ -4,7 +4,9 @@ import {
     computeAdaptiveTargetConcurrency,
     computeRunnerThroughput,
     estimateAdaptiveMaxConcurrency,
+    estimateAdaptiveSmsRpsConcurrencyCap,
     filterVisibleWorkerSnapshots,
+    shouldStopPhoneRetryForPause,
     type RunnerStatus,
     type WorkerSnapshot,
 } from "../src/runner.js";
@@ -92,6 +94,33 @@ test("adaptive target scales up when HeroSMS utilization is low", () => {
     );
 });
 
+test("adaptive max concurrency is capped by HeroSMS account RPS", () => {
+    assert.equal(
+        estimateAdaptiveSmsRpsConcurrencyCap({
+            configuredConcurrency: 10,
+            totalRpsLimit: 80,
+            targetSmsRpsUtilization: 0.8,
+        }),
+        64,
+    );
+    assert.equal(
+        estimateAdaptiveSmsRpsConcurrencyCap({
+            configuredConcurrency: 100,
+            totalRpsLimit: 80,
+            targetSmsRpsUtilization: 0.8,
+        }),
+        100,
+    );
+    assert.equal(
+        estimateAdaptiveSmsRpsConcurrencyCap({
+            configuredConcurrency: 25,
+            totalRpsLimit: 0,
+            targetSmsRpsUtilization: 0.8,
+        }),
+        25,
+    );
+});
+
 test("adaptive target drains on slot backpressure and memory pressure", () => {
     assert.deepEqual(
         computeAdaptiveTargetConcurrency({
@@ -157,4 +186,10 @@ test("adaptive worker snapshots only show live workers", () => {
         filterVisibleWorkerSnapshots(workers, "fixed").map((item) => item.workerId),
         [401, 402, 403],
     );
+});
+
+test("normal pause stops phone retry without taking the force-pause path", () => {
+    assert.equal(shouldStopPhoneRetryForPause(false), false);
+    assert.equal(shouldStopPhoneRetryForPause(true), true);
+    assert.equal(shouldStopPhoneRetryForPause(true, AbortSignal.abort()), false);
 });

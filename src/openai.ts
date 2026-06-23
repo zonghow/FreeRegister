@@ -34,6 +34,7 @@ type FetchLike = typeof fetch;
 const DEFAULT_INSECURE_TLS = true;
 const FETCH_RETRY_COUNT = 3;
 const FETCH_RETRY_DELAY_MS = 1500;
+const DEFAULT_OPENAI_FETCH_TIMEOUT_MS = 45_000;
 
 function resolveProxyUrl(): string {
     return appConfig.defaultProxyUrl;
@@ -167,6 +168,21 @@ interface JwtPayload {
     };
 }
 
+class OpenAIFetchTimeoutError extends Error {
+    constructor(url: string, timeoutMs: number) {
+        super(`OpenAI fetch 请求超时: ${url} timeout=${timeoutMs}ms`);
+        this.name = "OpenAIFetchTimeoutError";
+    }
+}
+
+function normalizeFetchTimeoutMs(value: unknown): number {
+    if (value == null) {
+        return DEFAULT_OPENAI_FETCH_TIMEOUT_MS;
+    }
+    const parsed = Math.floor(Number(value));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_OPENAI_FETCH_TIMEOUT_MS;
+}
+
 export interface AuthLoginResult {
     callbackURL: string;
     code: string;
@@ -211,6 +227,7 @@ export interface OpenAIClientOptions {
     saveAuthJson?: boolean;
     authJsonDir?: string;
     abortSignal?: AbortSignal;
+    fetchTimeoutMs?: number;
     /**
      * 当 OAuth 登录流程要求 add-email（phone-only 账号 codex CLI OAuth）时，
      * 用这个 email 提交 add-email/send，并通过 fetchAddEmailOtp 接 OTP。
@@ -242,6 +259,7 @@ export class OpenAIClient {
     readonly saveAuthJson: boolean;
     readonly authJsonDir: string;
     readonly abortSignal?: AbortSignal;
+    readonly fetchTimeoutMs: number;
 
     constructor(options: OpenAIClientOptions) {
         this.smsBroker = options.smsBroker;
@@ -253,6 +271,7 @@ export class OpenAIClient {
         this.saveAuthJson = options.saveAuthJson ?? true;
         this.authJsonDir = options.authJsonDir?.trim() || "auth";
         this.abortSignal = options.abortSignal;
+        this.fetchTimeoutMs = normalizeFetchTimeoutMs(options.fetchTimeoutMs);
         this.email = options.email?.trim() ?? "";
         this.password = options.password;
         this.deviceProfile = options.deviceProfile
@@ -270,12 +289,23 @@ export class OpenAIClient {
         this.signupScreenHint = options.signupScreenHint?.trim() || "login_or_signup";
         this.jar = new CookieJar();
         this.dispatcher = createDispatcher(this.proxyUrl, shouldAllowInsecureTLS());
-        const dispatcherFetch = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
-            undiciFetch(input as Parameters<typeof undiciFetch>[0], {
-                ...(init as Parameters<typeof undiciFetch>[1]),
-                signal: this.mergeAbortSignal((init as Parameters<typeof undiciFetch>[1] | undefined)?.signal),
-                dispatcher: this.dispatcher,
-            })) as unknown as FetchLike;
+        const dispatcherFetch = (async (input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
+            const request = this.createFetchRequestSignal((init as Parameters<typeof undiciFetch>[1] | undefined)?.signal);
+            try {
+                return await undiciFetch(input as Parameters<typeof undiciFetch>[0], {
+                    ...(init as Parameters<typeof undiciFetch>[1]),
+                    signal: request.signal,
+                    dispatcher: this.dispatcher,
+                });
+            } catch (error) {
+                if (request.timedOut()) {
+                    throw new OpenAIFetchTimeoutError(this.describeRetryTarget(input), this.fetchTimeoutMs);
+                }
+                throw error;
+            } finally {
+                request.cleanup();
+            }
+        }) as unknown as FetchLike;
         const cookieFetch = makeFetchCookie(dispatcherFetch, this.jar) as FetchLike;
         this.fetch = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
             this.fetchWithRetry(cookieFetch, input, init)) as FetchLike;
@@ -297,21 +327,54 @@ export class OpenAIClient {
         }
     }
 
-    private mergeAbortSignal(signal?: AbortSignal | null): AbortSignal | undefined {
-        if (!this.abortSignal) {
-            return signal ?? undefined;
+    private createFetchRequestSignal(signal?: AbortSignal | null): {signal?: AbortSignal; timedOut(): boolean; cleanup(): void} {
+        const signals = [signal, this.abortSignal].filter((item): item is AbortSignal => Boolean(item));
+        let timeoutReached = false;
+        let timeout: ReturnType<typeof setTimeout> | null = null;
+        const timeoutController = new AbortController();
+        if (this.fetchTimeoutMs > 0) {
+            timeout = setTimeout(() => {
+                timeoutReached = true;
+                timeoutController.abort();
+            }, this.fetchTimeoutMs);
+            timeout.unref?.();
+            signals.push(timeoutController.signal);
         }
-        if (!signal || signal === this.abortSignal) {
-            return this.abortSignal;
+
+        if (!signals.length) {
+            return {
+                signal: undefined,
+                timedOut: () => false,
+                cleanup: () => undefined,
+            };
         }
-        if (signal.aborted || this.abortSignal.aborted) {
-            return AbortSignal.abort();
+
+        const abortedSignal = signals.find((item) => item.aborted);
+        if (abortedSignal) {
+            return {
+                signal: AbortSignal.abort(abortedSignal.reason),
+                timedOut: () => timeoutReached && timeoutController.signal.aborted,
+                cleanup: () => {
+                    if (timeout) clearTimeout(timeout);
+                },
+            };
         }
+
         const controller = new AbortController();
-        const abort = () => controller.abort();
-        signal.addEventListener("abort", abort, {once: true});
-        this.abortSignal.addEventListener("abort", abort, {once: true});
-        return controller.signal;
+        const listeners: Array<() => void> = [];
+        for (const item of signals) {
+            const abort = () => controller.abort(item.reason);
+            item.addEventListener("abort", abort, {once: true});
+            listeners.push(() => item.removeEventListener("abort", abort));
+        }
+        return {
+            signal: controller.signal,
+            timedOut: () => timeoutReached && timeoutController.signal.aborted,
+            cleanup: () => {
+                if (timeout) clearTimeout(timeout);
+                for (const remove of listeners) remove();
+            },
+        };
     }
 
     async authLoginHTTP(): Promise<AuthLoginResult> {

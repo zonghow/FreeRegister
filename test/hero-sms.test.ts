@@ -127,6 +127,54 @@ test("normalizes HeroSMS country object maps", () => {
   );
 });
 
+test("activation leases include the selected HeroSMS country metadata", async () => {
+  resetHeroSmsRpsStatsForTest();
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const action = url.searchParams.get("action") ?? "";
+
+    if (action === "getNumberV2") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({activationId: "country-meta", phoneNumber: "573120000001"}));
+      return;
+    }
+
+    if (action === "setStatus") {
+      res.end("ACCESS_READY");
+      return;
+    }
+
+    res.statusCode = 400;
+    res.end("BAD_ACTION");
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  const broker = createSMSBroker({
+    apiKeys: ["key-a"],
+    apiKeyStrategy: "round_robin",
+    rpsLimit: 100,
+    baseUrl: `http://127.0.0.1:${address.port}/handler_api.php`,
+    timeoutMs: 1000,
+    countries: [73],
+    acquirePriority: "country",
+    minPrice: 0.03,
+    maxPrice: 0.03,
+    priceStep: 0.01,
+    pollIntervalMs: 1,
+    autoReleaseOnTimeout: false,
+  });
+
+  try {
+    const lease = await broker.getActivation();
+    assert.equal(lease.requestCountry, 73);
+    assert.equal(lease.requestMaxPrice, 0.03);
+    await broker.markAsFailed(true);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("auto releases HeroSMS activation after poll timeout", async () => {
   const calls: string[] = [];
   const server = createServer((req, res) => {

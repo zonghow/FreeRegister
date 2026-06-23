@@ -44,6 +44,7 @@ proxy_strategy = "direct"
 proxy_urls = []
 
 [proxies]
+mode = "pool"
 urls = []
 ```
 
@@ -196,7 +197,11 @@ success_ledger = "cost.success.jsonl"
 lock = ".cost.lock"
 
 [proxies]
+mode = "pool"
 urls = []
+phone_country_template = "socks5://gqa11186550-region-{code}-sid-{sid}-t-5:ble7bpcl@us.arxlabs.io:3010"
+country_code_url = "https://f.cliproxy.com/json/country_code.json"
+country_code_cache = ".cache/country-code.json"
 ```
 
 接码国家只配置 `countries`，单国家也写成一个元素的数组。`acquire_priority` 支持：
@@ -233,10 +238,15 @@ adaptive_control_interval_ms = 5000
 HeroSMS 的取号、查码、释放号码、余额和国家列表接口都按 `proxy_strategy` 走网络：
 
 - `hero_sms`：使用 `[hero_sms].proxy_urls` 专用代理池，注册任务中按 worker 轮询代理，后台余额和国家列表使用第一个专用代理。
-- `proxies`：复用 `[proxies].urls`，和 OpenAI/邮箱链路使用同一套代理池。
+- `proxies`：复用 `[proxies].urls` 代理池。
 - `direct`：HeroSMS 接口不走代理。
 
-OpenAI/邮箱链路仍只从 `[proxies].urls` 读取。留空表示直连；配置多个代理时会按 worker 轮询负载均衡：
+注册链路的 OpenAI/邮箱代理由 `[proxies].mode` 决定：
+
+- `pool`：保持旧逻辑，从 `[proxies].urls` 按 worker 轮询取代理；留空表示直连。
+- `phone_country`：先按现有 HeroSMS 逻辑取号，取到手机号后按该手机号国家生成代理；此模式不使用 `[proxies].urls` 作为注册代理。
+
+`phone_country_template` 支持 `{code}` 和 `{sid}` 两个占位符，`code` 来自 `country_code.json` 的 ISO alpha-2 国家码，`sid` 是每次换手机号新生成的 8 位数字+大小写字母：
 
 ```toml
 [hero_sms]
@@ -246,13 +256,17 @@ proxy_urls = [
 ]
 
 [proxies]
+mode = "phone_country"
 urls = [
   "socks5://127.0.0.1:7890",
   "http://127.0.0.1:8080"
 ]
+phone_country_template = "socks5://gqa11186550-region-{code}-sid-{sid}-t-5:ble7bpcl@us.arxlabs.io:3010"
+country_code_url = "https://f.cliproxy.com/json/country_code.json"
+country_code_cache = ".cache/country-code.json"
 ```
 
-Docker 中的 `127.0.0.1` 指容器本身。如果代理运行在宿主机上，通常需要使用 `host.docker.internal`。
+上面的 `urls` 仍可被 `hero_sms.proxy_strategy = "proxies"` 复用；在 `mode = "phone_country"` 下，OpenAI 手机注册、Codex OAuth 和邮箱 OTP 会使用手机号国家生成的代理。Docker 中的 `127.0.0.1` 指容器本身。如果代理运行在宿主机上，通常需要使用 `host.docker.internal`。
 
 ## 邮箱池状态
 

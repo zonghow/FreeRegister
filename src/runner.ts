@@ -5,6 +5,7 @@ import {appendSuccessCostRecord} from "./cost.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
 import {OpenAIClient} from "./openai.js";
+import {buildPhoneCountryProxy} from "./phone-country-proxy.js";
 import {createSMSBroker, getHeroSmsRpsStats} from "./sms/index.js";
 import {formatUtc8Timestamp} from "./utils.js";
 
@@ -12,6 +13,7 @@ export interface JobResult {
     ok: boolean;
     skipped?: boolean;
     forced?: boolean;
+    paused?: boolean;
 }
 
 export interface RegisterLogger {
@@ -104,6 +106,7 @@ const DEFAULT_LOGGER: RegisterLogger = {
 };
 
 const FORCE_PAUSE_MESSAGE = "任务已被强制暂停";
+const PAUSE_MESSAGE = "任务已暂停";
 const MEMORY_MONITOR_INTERVAL_MS = 5000;
 const AUTO_MEMORY_SOFT_RATIO = 0.82;
 const AUTO_MEMORY_HARD_RATIO = 0.9;
@@ -157,14 +160,28 @@ function createForcePauseError(): Error {
     return error;
 }
 
+function createPauseError(): Error {
+    const error = new Error(PAUSE_MESSAGE);
+    error.name = "PauseError";
+    return error;
+}
+
 function isForcePauseError(error: unknown): boolean {
     return error instanceof Error && (error.name === "ForcePauseError" || /aborted|abort|强制暂停/i.test(error.message));
+}
+
+function isPauseError(error: unknown): boolean {
+    return error instanceof Error && error.name === "PauseError";
 }
 
 function throwIfForcePaused(signal?: AbortSignal): void {
     if (signal?.aborted) {
         throw createForcePauseError();
     }
+}
+
+export function shouldStopPhoneRetryForPause(pauseRequested: boolean, signal?: AbortSignal): boolean {
+    return pauseRequested && !signal?.aborted;
 }
 
 function emptySnapshot(): RunnerSnapshot {
@@ -298,6 +315,12 @@ export interface AdaptiveTargetDecision {
     reason: string;
 }
 
+export interface AdaptiveSmsRpsConcurrencyCapInput {
+    configuredConcurrency: number;
+    totalRpsLimit: number;
+    targetSmsRpsUtilization: number;
+}
+
 export function heroSmsPressureSnapshot(config: AppConfig): HeroSmsPressureSnapshot {
     const keys = getHeroSmsRpsStats(config.heroSMS.apiKeys, {rpsLimit: config.heroSMS.rpsLimit});
     const activeKeys = keys.filter((item) => !item.disabled);
@@ -329,6 +352,16 @@ export function estimateAdaptiveMaxConcurrency(input: AdaptiveMaxConcurrencyInpu
     const capacityMb = Math.max(0, softLimitMb - baselineMb);
     const estimated = Math.floor(capacityMb / observedWorkerMb);
     return Math.min(absoluteMax, Math.max(1, estimated));
+}
+
+export function estimateAdaptiveSmsRpsConcurrencyCap(input: AdaptiveSmsRpsConcurrencyCapInput): number {
+    const configuredConcurrency = Math.max(1, Math.floor(input.configuredConcurrency || 1));
+    const totalRpsLimit = Math.max(0, Math.floor(input.totalRpsLimit || 0));
+    if (totalRpsLimit <= 0) {
+        return configuredConcurrency;
+    }
+    const targetUtil = Math.min(1, Math.max(0.1, input.targetSmsRpsUtilization || 0.9));
+    return Math.max(configuredConcurrency, Math.floor(totalRpsLimit * targetUtil));
 }
 
 export function computeAdaptiveTargetConcurrency(input: AdaptiveTargetInput): AdaptiveTargetDecision {
@@ -398,6 +431,21 @@ function createBroker(config: AppConfig, proxyUrl: string) {
     });
 }
 
+async function releaseFailedPhoneAttempt(smsBroker: ReturnType<typeof createBroker>): Promise<void> {
+    try {
+        await smsBroker.markAsFailed(true);
+        return;
+    } catch {
+        // The attempt may already be marked failed by waitForVerificationCode; still release the activation before stopping.
+    }
+
+    try {
+        await smsBroker.rotateActivation("failed");
+    } catch {
+        // Ignore provider cleanup errors; the caller is already handling the original failure.
+    }
+}
+
 function isEmailTouchedError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return /add-email|email-verification|email_already_in_use|Hotmail|邮箱|OTP/i.test(message);
@@ -405,17 +453,22 @@ function isEmailTouchedError(error: unknown): boolean {
 
 async function phoneSignup(
     config: AppConfig,
-    proxyUrl: string,
     workerId: number,
     logger: RegisterLogger,
     signal?: AbortSignal,
+    shouldPause?: () => boolean,
     updateWorker?: WorkerUpdate,
-): Promise<{phone: string; smsCost: number; smsGrossCost: number; smsRefundCost: number}> {
-    const smsBroker = createBroker(config, heroSmsProxyForWorker(config, workerId - 1));
+): Promise<{phone: string; proxyUrl: string; smsCost: number; smsGrossCost: number; smsRefundCost: number}> {
+    const smsProxyUrl = heroSmsProxyForWorker(config, workerId - 1);
+    const poolProxyUrl = proxyForWorker(config, workerId - 1);
+    const smsBroker = createBroker(config, smsProxyUrl);
     let lastErr: unknown = null;
 
     for (let phoneTry = 1; phoneTry <= config.heroSMS.maxPhoneTries; phoneTry += 1) {
         throwIfForcePaused(signal);
+        if (shouldStopPhoneRetryForPause(Boolean(shouldPause?.()), signal)) {
+            throw createPauseError();
+        }
         updateWorker?.({
             status: "running",
             stage: "phone_acquire",
@@ -425,13 +478,44 @@ async function phoneSignup(
         const lease = await smsBroker.getActivation();
         throwIfForcePaused(signal);
         const phoneNumber = `+${lease.phoneNumber}`;
+        let proxyUrl = poolProxyUrl;
+        try {
+            if (config.proxy.mode === "phone_country") {
+                const phoneProxy = await buildPhoneCountryProxy(config, {
+                    countryId: lease.requestCountry,
+                    countryLabel: lease.requestCountryLabel,
+                    countryName: lease.requestCountryName,
+                }, smsProxyUrl);
+                proxyUrl = phoneProxy.proxyUrl;
+                updateWorker?.({
+                    proxy: redactProxy(proxyUrl),
+                    latestLog: `取到号码 ${phoneNumber}，国家 ${phoneProxy.countryCode}，已生成代理`,
+                });
+                logger.info(
+                    `[worker-${workerId}] [proxy] phone=${phoneNumber} country=${phoneProxy.countryName}/${phoneProxy.countryCode} sid=${phoneProxy.sid} proxy=${proxyUrl || "direct"}`,
+                );
+            }
+        } catch (error) {
+            lastErr = error;
+            updateWorker?.({
+                status: "running",
+                stage: "phone_acquire",
+                phone: phoneNumber,
+                latestLog: `手机号国家代理生成失败，准备换号: ${(error as Error).message}`,
+                error: (error as Error).message,
+            });
+            logger.warn(`[worker-${workerId}] [proxy] 手机号国家代理生成失败，释放号码并换号: ${(error as Error).message}`);
+            await releaseFailedPhoneAttempt(smsBroker);
+            continue;
+        }
         updateWorker?.({
             status: "running",
             stage: "phone_signup",
             phone: phoneNumber,
+            proxy: redactProxy(proxyUrl),
             latestLog: `取到号码 ${phoneNumber}`,
         });
-        logger.info(`[worker-${workerId}] [phone] 取到号码 ${phoneNumber}`);
+        logger.info(`[worker-${workerId}] [phone] 取到号码 ${phoneNumber} proxy=${proxyUrl || "direct"}`);
 
         const signupClient = new OpenAIClient({
             email: undefined,
@@ -478,32 +562,33 @@ async function phoneSignup(
             const cost = smsBroker.getCostSummary();
             return {
                 phone: phoneNumber,
+                proxyUrl,
                 smsCost: cost.netCost,
                 smsGrossCost: cost.grossCost,
                 smsRefundCost: cost.refundCost,
             };
         } catch (error) {
             if (signal?.aborted) {
-                try {
-                    await smsBroker.markAsFailed(true);
-                } catch {
-                    // 忽略接码平台回收失败，继续结束任务。
-                }
+                await releaseFailedPhoneAttempt(smsBroker);
                 throw createForcePauseError();
             }
             lastErr = error;
+            const pauseAfterAttempt = shouldStopPhoneRetryForPause(Boolean(shouldPause?.()), signal);
             updateWorker?.({
                 status: "running",
                 stage: "phone_acquire",
                 phone: phoneNumber,
-                latestLog: `手机号失败，准备换号: ${(error as Error).message}`,
+                latestLog: pauseAfterAttempt
+                    ? `手机号失败，暂停中不再换号: ${(error as Error).message}`
+                    : `手机号失败，准备换号: ${(error as Error).message}`,
                 error: (error as Error).message,
             });
-            logger.warn(`[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 失败: ${(error as Error).message}`);
-            try {
-                await smsBroker.markAsFailed(true);
-            } catch {
-                // 忽略接码平台回收失败，继续换号。
+            logger.warn(
+                `[worker-${workerId}] [phone] (${phoneTry}/${config.heroSMS.maxPhoneTries}) 失败: ${(error as Error).message}${pauseAfterAttempt ? "，暂停中不再换号" : ""}`,
+            );
+            await releaseFailedPhoneAttempt(smsBroker);
+            if (pauseAfterAttempt) {
+                throw createPauseError();
             }
         } finally {
             try {
@@ -611,10 +696,11 @@ export async function runOne(
     workerId: number,
     logger: RegisterLogger = DEFAULT_LOGGER,
     signal?: AbortSignal,
+    shouldPause?: () => boolean,
     updateWorker?: WorkerUpdate,
 ): Promise<JobResult> {
     throwIfForcePaused(signal);
-    const proxyUrl = proxyForWorker(config, workerId - 1);
+    let proxyUrl = config.proxy.mode === "pool" ? proxyForWorker(config, workerId - 1) : "";
     const smsProxyUrl = heroSmsProxyForWorker(config, workerId - 1);
     const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(config.run.total);
     updateWorker?.({
@@ -623,12 +709,14 @@ export async function runOne(
         jobId,
         email: "",
         phone: "",
-        proxy: redactProxy(proxyUrl),
+        proxy: config.proxy.mode === "phone_country" ? "pending-phone-country" : redactProxy(proxyUrl),
         startedAt: new Date().toISOString(),
         latestLog: `job ${jobId}/${totalLabel} 开始`,
         error: "",
     });
-    logger.info(`\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxy=${redactProxy(proxyUrl)} heroSmsProxy=${redactProxy(smsProxyUrl)} ==========`);
+    logger.info(
+        `\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxyMode=${config.proxy.mode} proxy=${config.proxy.mode === "phone_country" ? "pending-phone-country" : redactProxy(proxyUrl)} heroSmsProxy=${redactProxy(smsProxyUrl)} ==========`,
+    );
 
     const emailLease = await pool.leaseEmail();
     if (!emailLease) {
@@ -653,8 +741,9 @@ export async function runOne(
     let smsGrossCost = 0;
     let smsRefundCost = 0;
     try {
-        const signup = await phoneSignup(config, proxyUrl, workerId, logger, signal, updateWorker);
+        const signup = await phoneSignup(config, workerId, logger, signal, shouldPause, updateWorker);
         phone = signup.phone;
+        proxyUrl = signup.proxyUrl;
         smsCost = signup.smsCost;
         smsGrossCost = signup.smsGrossCost;
         smsRefundCost = signup.smsRefundCost;
@@ -669,6 +758,17 @@ export async function runOne(
             logger.warn(`[worker-${workerId}] [force-pause] 手机阶段中止，邮箱放回池: ${emailLease.email}`);
             await pool.returnToSource(emailLease);
             return {ok: false, forced: true};
+        }
+        if (isPauseError(error)) {
+            updateWorker?.({
+                status: "paused",
+                stage: "idle",
+                email: emailLease.email,
+                latestLog: `手机阶段暂停，邮箱放回池: ${emailLease.email}`,
+            });
+            logger.warn(`[worker-${workerId}] [pause] 手机阶段暂停，邮箱放回池: ${emailLease.email}`);
+            await pool.returnToSource(emailLease);
+            return {ok: false, paused: true};
         }
         updateWorker?.({
             status: "failed",
@@ -929,13 +1029,19 @@ export class RegisterTaskRunner {
         const rpsEwma = previousRpsEwma <= 0
             ? pressure.utilization
             : (previousRpsEwma * (1 - ADAPTIVE_EWMA_ALPHA)) + (pressure.utilization * ADAPTIVE_EWMA_ALPHA);
-        const maxConcurrency = estimateAdaptiveMaxConcurrency({
+        const memoryMaxConcurrency = estimateAdaptiveMaxConcurrency({
             memory,
             baselineGuardUsedMb,
             currentConcurrency: Math.max(1, this.snapshot.currentConcurrency),
             absoluteMax: ADAPTIVE_ABSOLUTE_MAX_CONCURRENCY,
         });
         const targetUtil = config.run.adaptiveTargetSmsRpsUtilization;
+        const smsRpsMaxConcurrency = estimateAdaptiveSmsRpsConcurrencyCap({
+            configuredConcurrency: this.snapshot.concurrency,
+            totalRpsLimit: pressure.totalLimit,
+            targetSmsRpsUtilization: targetUtil,
+        });
+        const maxConcurrency = Math.min(memoryMaxConcurrency, smsRpsMaxConcurrency);
         const decision = computeAdaptiveTargetConcurrency({
             currentConcurrency: this.snapshot.currentConcurrency,
             targetConcurrency: this.snapshot.targetConcurrency || this.snapshot.concurrency || 1,
@@ -1101,9 +1207,10 @@ export class RegisterTaskRunner {
                         workerId,
                         this.logger,
                         this.abortController?.signal,
+                        () => this.pauseRequested && !this.forcePauseRequested,
                         (patch) => this.updateWorker(workerId, patch),
                     );
-                    if (result.forced) {
+                    if (result.forced || result.paused) {
                         return;
                     }
                     if (result.ok) {

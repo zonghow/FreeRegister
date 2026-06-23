@@ -34,6 +34,13 @@ test("sms config UI hides advanced HeroSMS fields", async () => {
     assert.match(source, /<h2>接码配置<\/h2>/);
     assert.match(source, /<h2>配置操作<\/h2>/);
     assert.match(source, /id="runConcurrencyMode"/);
+    assert.match(source, /id="proxyMode"/);
+    assert.match(source, /id="phoneCountryTemplate"/);
+    assert.match(source, /手机号国家代理模板/);
+    assert.match(source, /smsConfigDirty:\s*false/);
+    assert.match(source, /function markSmsConfigDirty\(\)/);
+    assert.match(source, /if \(!state\.smsConfigDirty\) \{/);
+    assert.match(source, /fillProxyForm\(proxy\)/);
     assert.match(source, /id="saveSmsConfigBtn"/);
     assert.doesNotMatch(source, /id="saveRunConfigBtn"/);
     assert.doesNotMatch(source, /\/api\/run-config/);
@@ -75,6 +82,8 @@ test("sms config save payload preserves hidden config fields", async () => {
         assert.doesNotMatch(payloadSource, new RegExp(`${hiddenField}\\s*:`));
     }
     assert.match(payloadSource, /concurrencyMode\s*:/);
+    assert.match(payloadSource, /proxyMode\s*:/);
+    assert.match(payloadSource, /phoneCountryTemplate\s*:/);
     assert.match(payloadSource, /apiKeyStrategy\s*:/);
     assert.match(valuesSource, /api_key_strategy\s*:/);
     for (const hiddenTomlKey of ["api_key", "api_keys", "rps_limit", "proxy_urls", "poll_interval_ms", "auto_release_on_timeout"]) {
@@ -94,6 +103,9 @@ test("sms config save also persists only the run concurrency mode", async () => 
     assert.match(runValuesSource, /concurrency_mode\s*:/);
     assert.match(runValuesSource, /runConcurrencyModeFromBody/);
     assert.match(handlerSource, /upsertTomlSection\(content,\s*"run",\s*runValues\)/);
+    assert.match(handlerSource, /const proxyValues = \{/);
+    assert.match(handlerSource, /phone_country_template\s*:/);
+    assert.match(handlerSource, /upsertTomlSection\(\s*upsertTomlSection\(content,\s*"run",\s*runValues\),\s*"proxies",\s*proxyValues,\s*\)/);
     for (const untouchedKey of ["total", "concurrency:", "adaptive_target_sms_rps_utilization", "adaptive_control_interval_ms"]) {
         assert.doesNotMatch(runValuesSource, new RegExp(untouchedKey));
     }

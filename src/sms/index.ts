@@ -52,6 +52,7 @@ interface KeyAccount {
 }
 
 const keySetCursors = new Map<string, number>();
+const ALL_KEYS_RPS_LIMIT_LOG_INTERVAL_MS = 1000;
 
 function roundPrice(value: number): number {
   return Math.round(value * 10000) / 10000;
@@ -170,6 +171,8 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
   const rateLimitWindowMs = normalizeRateLimitWindowMs(option.rateLimitWindowMs);
   const selectionKey = keySetId(apiKeys);
   const accountByActivationId = new Map<string, KeyAccount>();
+  let lastAllKeysRpsLimitLogAt = 0;
+  let suppressedAllKeysRpsLimitLogs = 0;
   const accounts = apiKeys.map((apiKey, index): KeyAccount => ({
     index,
     apiKey,
@@ -203,6 +206,19 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
     return accounts.filter((account) => !account.disabled && !accountRateSnapshot(account, rpsLimit, rateLimitWindowMs).disabled);
   }
 
+  function logAllKeysRpsLimited(waitMs: number): void {
+    const now = Date.now();
+    if (now - lastAllKeysRpsLimitLogAt < ALL_KEYS_RPS_LIMIT_LOG_INTERVAL_MS) {
+      suppressedAllKeysRpsLimitLogs += 1;
+      return;
+    }
+    const suppressed = suppressedAllKeysRpsLimitLogs;
+    suppressedAllKeysRpsLimitLogs = 0;
+    lastAllKeysRpsLimitLogAt = now;
+    const suffix = suppressed > 0 ? `，已合并 ${suppressed} 条相同等待日志` : "";
+    console.warn(`[heroSMS] 所有 API key 均达到账号级 API RPS 限制，等待 ${waitMs}ms${suffix}`);
+  }
+
   async function selectAccount(): Promise<KeyAccount> {
     for (;;) {
       const availableAccounts = activeAccounts();
@@ -234,7 +250,7 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
       const waitMs = Math.min(
         ...availableAccounts.map((account) => accountRateSnapshot(account, rpsLimit, rateLimitWindowMs).waitMs || 1),
       );
-      console.warn(`[heroSMS] 所有 API key 均达到账号级 API RPS 限制，等待 ${waitMs}ms`);
+      logAllKeysRpsLimited(waitMs);
       await sleep(waitMs);
     }
   }
@@ -293,7 +309,11 @@ export const createSMSBroker = (option: HeroSMSBrokerOption) => {
           });
           planCursor = index;
           console.log(`[heroSMS] 取号成功 country=${candidate.country} phone=+${activation.phoneNumber} cost=${activation.activationCost ?? '?'}`);
-          return activation;
+          return {
+            ...activation,
+            requestCountry: candidate.country,
+            requestMaxPrice: candidate.maxPrice,
+          };
         } catch (err) {
           lastErr = err;
           const msg = String((err as Error)?.message ?? err).toUpperCase();

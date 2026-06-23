@@ -68,9 +68,17 @@ currency = "USD"
 success_ledger = "cost.success.jsonl"
 lock = ".cost.lock"
 
-# 代理池。多个代理会按 worker 轮询负载均衡。
+# 注册代理。
+# mode:
+#   "pool" 保持旧逻辑，从 urls 代理池按 worker 轮询取代理。
+#   "phone_country" 取到手机号后，按手机号国家渲染 phone_country_template；此模式不使用 urls 作为注册代理。
+# phone_country_template 支持 {code} 和 {sid} 占位符，sid 是每个手机号新生成的 8 位数字+大小写字母。
 [proxies]
+mode = "pool"
 urls = []
+phone_country_template = "socks5://gqa11186550-region-{code}-sid-{sid}-t-5:ble7bpcl@us.arxlabs.io:3010"
+country_code_url = "https://f.cliproxy.com/json/country_code.json"
+country_code_cache = ".cache/country-code.json"
 
 # 只有 use_browser_sentinel = true 时才需要浏览器。
 [sentinel_browser]

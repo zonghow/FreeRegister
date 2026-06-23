@@ -66,6 +66,14 @@ export interface CostConfig {
     lock: string;
 }
 
+export interface ProxyConfig {
+    mode: ProxyMode;
+    urls: string[];
+    phoneCountryTemplate: string;
+    countryCodeUrl: string;
+    countryCodeCache: string;
+}
+
 export interface AppConfig {
     run: RunConfig;
     openai: OpenAIConfig;
@@ -73,6 +81,7 @@ export interface AppConfig {
     emailPool: EmailPoolConfig;
     cpaJson: CpaJsonConfig;
     cost: CostConfig;
+    proxy: ProxyConfig;
     proxies: string[];
     sentinelBrowser: SentinelBrowserConfig;
     sentinelSdk: SentinelSdkConfig;
@@ -82,9 +91,13 @@ export interface AppConfig {
 
 export type HeroSMSApiKeyStrategy = "round_robin" | "fill_first";
 export type HeroSMSProxyStrategy = "hero_sms" | "proxies" | "direct";
+export type ProxyMode = "pool" | "phone_country";
 export type RunConcurrencyMode = "fixed" | "adaptive";
 type TomlValue = string | number | boolean | string[] | number[];
 type TomlObject = Record<string, Record<string, TomlValue>>;
+
+export const DEFAULT_PHONE_COUNTRY_PROXY_TEMPLATE = "socks5://gqa11186550-region-{code}-sid-{sid}-t-5:ble7bpcl@us.arxlabs.io:3010";
+export const DEFAULT_COUNTRY_CODE_URL = "https://f.cliproxy.com/json/country_code.json";
 
 const DEFAULT_CONFIG: AppConfig = {
     run: {
@@ -135,6 +148,13 @@ const DEFAULT_CONFIG: AppConfig = {
         currency: "USD",
         successLedger: "cost.success.jsonl",
         lock: ".cost.lock",
+    },
+    proxy: {
+        mode: "pool",
+        urls: [],
+        phoneCountryTemplate: DEFAULT_PHONE_COUNTRY_PROXY_TEMPLATE,
+        countryCodeUrl: DEFAULT_COUNTRY_CODE_URL,
+        countryCodeCache: path.join(".cache", "country-code.json"),
     },
     proxies: [],
     sentinelBrowser: {
@@ -331,6 +351,13 @@ function normalizeHeroSmsProxyStrategy(
     return legacyUseProxy ? "proxies" : DEFAULT_CONFIG.heroSMS.proxyStrategy;
 }
 
+function normalizeProxyMode(value: TomlValue | undefined, fallback: ProxyMode): ProxyMode {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    if (["phone_country", "phone-country", "phonecountry", "country", "by_phone_country"].includes(normalized)) return "phone_country";
+    if (["pool", "proxy_pool", "urls", "list"].includes(normalized)) return "pool";
+    return fallback;
+}
+
 function pathValue(value: TomlValue | undefined, fallback: string, baseDir: string): string {
     const raw = stringValue(value, fallback);
     return path.isAbsolute(raw) ? raw : path.resolve(baseDir, raw);
@@ -394,6 +421,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
             defaultPassword: defaultPassword || config.openai.defaultPassword,
             saveAuthJson: saveAuthJson ?? config.openai.saveAuthJson,
         },
+        proxy: config.proxy,
         proxies: config.proxies,
         cpaJson: {
             ...config.cpaJson,
@@ -437,6 +465,13 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
     const sentinelSdk = parsed.sentinel_sdk ?? {};
 
     const proxyUrls = stringArrayValue(proxies.urls);
+    const proxyConfig: ProxyConfig = {
+        mode: normalizeProxyMode(proxies.mode, DEFAULT_CONFIG.proxy.mode),
+        urls: proxyUrls,
+        phoneCountryTemplate: stringValue(proxies.phone_country_template, DEFAULT_CONFIG.proxy.phoneCountryTemplate),
+        countryCodeUrl: stringValue(proxies.country_code_url, DEFAULT_CONFIG.proxy.countryCodeUrl),
+        countryCodeCache: pathValue(proxies.country_code_cache, DEFAULT_CONFIG.proxy.countryCodeCache, configDir),
+    };
     const openAIConfig: OpenAIConfig = {
         defaultPassword: stringValue(openai.default_password, DEFAULT_CONFIG.openai.defaultPassword),
         saveAuthJson: booleanValue(openai.save_auth_json, DEFAULT_CONFIG.openai.saveAuthJson),
@@ -511,6 +546,7 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
             successLedger: pathValue(cost.success_ledger, DEFAULT_CONFIG.cost.successLedger, configDir),
             lock: pathValue(cost.lock, DEFAULT_CONFIG.cost.lock, configDir),
         },
+        proxy: proxyConfig,
         proxies: proxyUrls,
         sentinelBrowser: {
             path: stringValue(sentinelBrowser.path, DEFAULT_CONFIG.sentinelBrowser.path),

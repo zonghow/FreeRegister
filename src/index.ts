@@ -6,13 +6,26 @@ async function main(): Promise<void> {
     const runner = new RegisterTaskRunner();
 
     let stopping = false;
-    process.once("SIGINT", () => {
+    const shutdown = (signal: NodeJS.Signals, exitCode: number): void => {
         if (stopping) {
-            process.exit(130);
+            process.exit(exitCode);
         }
         stopping = true;
-        runner.pause();
-    });
+        console.warn(`[FreeRegister] 收到 ${signal}，强制暂停任务并退出`);
+        runner.forcePause();
+        const forceExitTimer = setTimeout(() => {
+            console.error(`[FreeRegister] ${signal} 后等待任务退出超时，强制退出`);
+            process.exit(exitCode);
+        }, 9000);
+        forceExitTimer.unref?.();
+        void runner.wait().finally(() => {
+            clearTimeout(forceExitTimer);
+            process.exit(exitCode);
+        });
+    };
+
+    process.once("SIGINT", () => shutdown("SIGINT", 130));
+    process.once("SIGTERM", () => shutdown("SIGTERM", 143));
 
     runner.start(config);
     const result = await runner.wait();

@@ -402,11 +402,7 @@ export class ActivationBroker<
     requestedAnotherSms: boolean,
   ): ActivationLease {
     return {
-      activationId: activation.activationId,
-      phoneNumber: activation.phoneNumber,
-      expiresAt: activation.expiresAt,
-      canRequestAnotherSms: activation.canRequestAnotherSms,
-      activationCost: activation.activationCost,
+      ...activation,
       isNewActivation,
       requestedAnotherSms,
       round: this.round,
