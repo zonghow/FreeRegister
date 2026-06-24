@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
+import {mkdtemp, rm} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import type {AppConfig} from "../src/config.js";
 import {
     computeAdaptiveTargetConcurrency,
     computeRunnerThroughput,
     estimateAdaptiveMaxConcurrency,
     estimateAdaptiveSmsRpsConcurrencyCap,
     filterVisibleWorkerSnapshots,
+    RegisterTaskRunner,
     shouldStopPhoneRetryForPause,
     type RunnerStatus,
     type WorkerSnapshot,
@@ -13,6 +18,77 @@ import {
 
 function snapshot(status: RunnerStatus, startedAt: string, endedAt: string, okCount: number) {
     return {status, startedAt, endedAt, okCount};
+}
+
+function testConfig(dir: string): AppConfig {
+    return {
+        run: {
+            total: 100,
+            concurrency: 5,
+            concurrencyMode: "fixed",
+            maxPhoneTries: 20,
+            useBrowserSentinel: false,
+            runUntilEmpty: false,
+            adaptiveTargetSmsRpsUtilization: 0.9,
+            adaptiveControlIntervalMs: 1000,
+            memorySoftLimitMb: 0,
+            memoryHardLimitMb: 0,
+        },
+        openai: {
+            defaultPassword: "pw",
+            saveAuthJson: false,
+        },
+        heroSMS: {
+            apiKey: "test-key",
+            apiKeys: ["test-key"],
+            apiKeyStrategy: "round_robin",
+            rpsLimit: 40,
+            proxyStrategy: "direct",
+            proxyUrls: [],
+            useProxy: false,
+            countries: [33],
+            acquirePriority: "country",
+            minPrice: 0.03,
+            maxPrice: 0.05,
+            priceStep: 0.01,
+            pollIntervalMs: 3000,
+            maxPhoneTries: 20,
+            autoReleaseOnTimeout: true,
+        },
+        emailPool: {
+            source: path.join(dir, "email.txt"),
+            success: path.join(dir, "email.success.txt"),
+            inflight: path.join(dir, "email.inflight.txt"),
+            failed: path.join(dir, "email.failed.txt"),
+            lock: path.join(dir, ".email.lock"),
+        },
+        cpaJson: {
+            dir: path.join(dir, "cpa_json"),
+        },
+        cost: {
+            emailUnitCost: 0.01,
+            currency: "USD",
+            successLedger: path.join(dir, "cost.success.jsonl"),
+            lock: path.join(dir, ".cost.lock"),
+        },
+        proxy: {
+            mode: "pool",
+            urls: [],
+            phoneCountryTemplate: "",
+            countryCodeUrl: "",
+            countryCodeCache: path.join(dir, "country_code.json"),
+        },
+        proxies: [],
+        sentinelBrowser: {
+            path: "",
+        },
+        sentinelSdk: {
+            url: "",
+            file: path.join(dir, "sdk.js"),
+        },
+        defaultProxyUrl: "",
+        defaultPassword: "pw",
+    };
 }
 
 test("runner throughput uses current time while task is active", () => {
@@ -192,4 +268,32 @@ test("normal pause stops phone retry without taking the force-pause path", () =>
     assert.equal(shouldStopPhoneRetryForPause(false), false);
     assert.equal(shouldStopPhoneRetryForPause(true), true);
     assert.equal(shouldStopPhoneRetryForPause(true, AbortSignal.abort()), false);
+});
+
+test("force pause immediately makes the runner terminal", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-force-pause-"));
+    const logs: string[] = [];
+    const runner = new RegisterTaskRunner({
+        info: (message) => logs.push(message),
+        warn: (message) => logs.push(message),
+        error: (message) => logs.push(message),
+    });
+
+    try {
+        runner.start(testConfig(dir));
+        const snapshot = runner.forcePause();
+
+        assert.equal(snapshot.status, "force_paused");
+        assert.equal(snapshot.activeWorkers, 0);
+        assert.equal(snapshot.currentConcurrency, 0);
+        assert.deepEqual(snapshot.workers, []);
+
+        const waited = await runner.wait();
+        assert.equal(waited.status, "force_paused");
+        assert.equal(waited.activeWorkers, 0);
+        assert.equal(waited.currentConcurrency, 0);
+        assert.deepEqual(waited.workers, []);
+    } finally {
+        await rm(dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    }
 });

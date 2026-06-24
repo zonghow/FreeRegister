@@ -397,6 +397,19 @@ export function computeAdaptiveTargetConcurrency(input: AdaptiveTargetInput): Ad
 
 type WorkerUpdate = (patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>) => void;
 type WorkerLoop = (workerId: number, adaptive: boolean) => Promise<void>;
+type ForcePauseLeaseMode = "return" | "fail";
+
+interface RunOneHooks {
+    onEmailLeaseAcquired?: (lease: EmailLease) => void;
+    onEmailLeaseSettled?: () => void;
+    isHardForcePaused?: () => boolean;
+}
+
+interface ActiveEmailLease {
+    pool: EmailPool;
+    lease: EmailLease;
+    mode: ForcePauseLeaseMode;
+}
 
 interface WorkerRunState {
     sourceEmpty: boolean;
@@ -405,6 +418,18 @@ interface WorkerRunState {
 
 function sleepMs(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, Math.max(1, ms)));
+}
+
+function forcePauseLeaseModeForStage(stage: WorkerStage): ForcePauseLeaseMode {
+    switch (stage) {
+        case "oauth_start":
+        case "email_otp_wait":
+        case "oauth_exchange":
+        case "success":
+            return "fail";
+        default:
+            return "return";
+    }
 }
 
 function adaptiveScaleStep(value: number): number {
@@ -698,6 +723,7 @@ export async function runOne(
     signal?: AbortSignal,
     shouldPause?: () => boolean,
     updateWorker?: WorkerUpdate,
+    hooks: RunOneHooks = {},
 ): Promise<JobResult> {
     throwIfForcePaused(signal);
     let proxyUrl = config.proxy.mode === "pool" ? proxyForWorker(config, workerId - 1) : "";
@@ -728,6 +754,15 @@ export async function runOne(
         logger.warn(`[worker-${workerId}] 邮箱池为空，跳过 job=${jobId}`);
         return {ok: false, skipped: true};
     }
+    hooks.onEmailLeaseAcquired?.(emailLease);
+    const settleEmailLease = async (operation: () => Promise<void>): Promise<void> => {
+        await operation();
+        hooks.onEmailLeaseSettled?.();
+    };
+    if (hooks.isHardForcePaused?.() || signal?.aborted) {
+        await settleEmailLease(() => pool.returnToSource(emailLease));
+        return {ok: false, forced: true};
+    }
     updateWorker?.({
         status: "running",
         stage: "phone_acquire",
@@ -742,6 +777,17 @@ export async function runOne(
     let smsRefundCost = 0;
     try {
         const signup = await phoneSignup(config, workerId, logger, signal, shouldPause, updateWorker);
+        if (hooks.isHardForcePaused?.() || signal?.aborted) {
+            updateWorker?.({
+                status: "force_paused",
+                stage: "force_paused",
+                email: emailLease.email,
+                latestLog: `手机阶段中止，邮箱放回池: ${emailLease.email}`,
+            });
+            logger.warn(`[worker-${workerId}] [force-pause] 手机阶段中止，邮箱放回池: ${emailLease.email}`);
+            await settleEmailLease(() => pool.returnToSource(emailLease));
+            return {ok: false, forced: true};
+        }
         phone = signup.phone;
         proxyUrl = signup.proxyUrl;
         smsCost = signup.smsCost;
@@ -756,7 +802,7 @@ export async function runOne(
                 latestLog: `手机阶段中止，邮箱放回池: ${emailLease.email}`,
             });
             logger.warn(`[worker-${workerId}] [force-pause] 手机阶段中止，邮箱放回池: ${emailLease.email}`);
-            await pool.returnToSource(emailLease);
+            await settleEmailLease(() => pool.returnToSource(emailLease));
             return {ok: false, forced: true};
         }
         if (isPauseError(error)) {
@@ -767,7 +813,7 @@ export async function runOne(
                 latestLog: `手机阶段暂停，邮箱放回池: ${emailLease.email}`,
             });
             logger.warn(`[worker-${workerId}] [pause] 手机阶段暂停，邮箱放回池: ${emailLease.email}`);
-            await pool.returnToSource(emailLease);
+            await settleEmailLease(() => pool.returnToSource(emailLease));
             return {ok: false, paused: true};
         }
         updateWorker?.({
@@ -778,13 +824,16 @@ export async function runOne(
             error: (error as Error).message,
         });
         logger.warn(`[worker-${workerId}] [phone] 注册失败，邮箱放回池: ${(error as Error).message}`);
-        await pool.returnToSource(emailLease);
+        await settleEmailLease(() => pool.returnToSource(emailLease));
         return {ok: false};
     }
 
     try {
         await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal, updateWorker);
-        await pool.markSuccess(emailLease);
+        if (hooks.isHardForcePaused?.() || signal?.aborted) {
+            throw createForcePauseError();
+        }
+        await settleEmailLease(() => pool.markSuccess(emailLease));
         try {
             const costRecord = await appendSuccessCostRecord(config.cost, {
                 email: emailLease.email,
@@ -822,7 +871,7 @@ export async function runOne(
                 error: reason,
             });
             logger.warn(`[worker-${workerId}] [force-pause] email=${emailLease.email} reason=${reason}`);
-            await pool.markFailed(emailLease, reason);
+            await settleEmailLease(() => pool.markFailed(emailLease, reason));
             logger.info(`[POOL-RESULT] status=force-paused phone=${phone} email=${emailLease.email}`);
             return {ok: false, forced: true};
         }
@@ -837,7 +886,7 @@ export async function runOne(
             error: reason,
         });
         logger.warn(`[worker-${workerId}] [failed] email=${emailLease.email} reason=${reason}`);
-        await pool.markFailed(emailLease, reason);
+        await settleEmailLease(() => pool.markFailed(emailLease, reason));
         logger.info(`[POOL-RESULT] status=failed phone=${phone} email=${emailLease.email}`);
         return {ok: false};
     }
@@ -852,8 +901,13 @@ export class RegisterTaskRunner {
     private memoryMonitor: ReturnType<typeof setInterval> | null = null;
     private memoryGuardLevel: MemoryGuardLevel = "ok";
     private memoryConfig: AppConfig | null = null;
+    private runId = 0;
+    private hardForcePausedRunId = 0;
+    private forcePausePromise: Promise<void> = Promise.resolve();
+    private resolveForcePause: (() => void) | null = null;
     private readonly workerSnapshots = new Map<number, WorkerSnapshot>();
     private readonly liveAdaptiveWorkerIds = new Set<number>();
+    private readonly activeEmailLeases = new Map<string, ActiveEmailLease>();
 
     constructor(private readonly logger: RegisterLogger = DEFAULT_LOGGER) {}
 
@@ -870,9 +924,14 @@ export class RegisterTaskRunner {
         this.forcePauseRequested = false;
         this.memoryGuardLevel = "ok";
         this.memoryConfig = config;
+        this.runId += 1;
+        const runId = this.runId;
+        this.hardForcePausedRunId = 0;
+        this.resetForcePauseSignal();
         this.abortController = new AbortController();
         this.workerSnapshots.clear();
         this.liveAdaptiveWorkerIds.clear();
+        this.activeEmailLeases.clear();
         const initialWorkers = config.run.concurrencyMode === "adaptive"
             ? []
             : Array.from({length: concurrency}, (_, index) => emptyWorkerSnapshot(index + 1));
@@ -897,31 +956,44 @@ export class RegisterTaskRunner {
         };
 
         this.startMemoryMonitor(config);
-        this.promise = this.run(config)
+        this.promise = this.run(config, runId)
             .catch((error) => {
+                if (!this.isCurrentRun(runId)) {
+                    return this.snapshot;
+                }
                 this.snapshot.status = "failed";
                 this.snapshot.lastError = error instanceof Error ? error.stack || error.message : String(error);
                 this.logger.error(`[FreeRegister] 致命错误: ${this.snapshot.lastError}`);
                 return this.snapshot;
             })
             .finally(() => {
+                if (!this.isCurrentRun(runId)) {
+                    return;
+                }
                 this.stopMemoryMonitor();
                 this.snapshot.memory = runtimeMemorySnapshot(config);
-                this.snapshot.endedAt = new Date().toISOString();
+                if (!this.snapshot.endedAt) {
+                    this.snapshot.endedAt = new Date().toISOString();
+                }
                 this.snapshot.activeWorkers = 0;
                 this.snapshot.currentConcurrency = 0;
-                for (const worker of this.workerSnapshots.values()) {
-                    if (worker.status === "running") {
-                        this.updateWorker(worker.workerId, {
-                            status: this.forcePauseRequested ? "force_paused" : "idle",
-                            stage: this.forcePauseRequested ? "force_paused" : "idle",
-                            latestLog: this.forcePauseRequested ? "已强制暂停" : "已停止",
-                        });
-                    }
-                }
-                if (this.snapshot.concurrencyMode === "adaptive") {
-                    this.liveAdaptiveWorkerIds.clear();
+                if (this.hardForcePausedRunId === runId) {
                     this.workerSnapshots.clear();
+                    this.liveAdaptiveWorkerIds.clear();
+                } else {
+                    for (const worker of this.workerSnapshots.values()) {
+                        if (worker.status === "running") {
+                            this.updateWorker(worker.workerId, {
+                                status: this.forcePauseRequested ? "force_paused" : "idle",
+                                stage: this.forcePauseRequested ? "force_paused" : "idle",
+                                latestLog: this.forcePauseRequested ? "已强制暂停" : "已停止",
+                            });
+                        }
+                    }
+                    if (this.snapshot.concurrencyMode === "adaptive") {
+                        this.liveAdaptiveWorkerIds.clear();
+                        this.workerSnapshots.clear();
+                    }
                 }
             });
 
@@ -938,12 +1010,14 @@ export class RegisterTaskRunner {
     }
 
     forcePause(): RunnerSnapshot {
-        if (this.snapshot.status === "running" || this.snapshot.status === "pausing") {
+        if (this.snapshot.status === "running" || this.snapshot.status === "pausing" || this.snapshot.status === "force_pausing") {
             this.pauseRequested = true;
             this.forcePauseRequested = true;
-            this.snapshot.status = "force_pausing";
             this.logger.warn("[FreeRegister] 收到强制暂停请求：立即中止当前任务");
             this.abortController?.abort();
+            this.resolveForcePause?.();
+            this.hardFinalizeForcePause();
+            void this.cleanupForcePausedLeases();
         }
         return this.getSnapshot();
     }
@@ -980,6 +1054,94 @@ export class RegisterTaskRunner {
         this.memoryMonitor = null;
     }
 
+    private resetForcePauseSignal(): void {
+        this.resolveForcePause = null;
+        this.forcePausePromise = new Promise((resolve) => {
+            this.resolveForcePause = resolve;
+        });
+    }
+
+    private waitForForcePause(): Promise<void> {
+        return this.forcePausePromise;
+    }
+
+    private isCurrentRun(runId: number): boolean {
+        return runId === this.runId;
+    }
+
+    private isRunMutable(runId: number): boolean {
+        return this.isCurrentRun(runId) && this.hardForcePausedRunId !== runId;
+    }
+
+    private activeEmailLeaseKey(runId: number, workerId: number): string {
+        return `${runId}:${workerId}`;
+    }
+
+    private registerActiveEmailLease(runId: number, workerId: number, pool: EmailPool, lease: EmailLease): void {
+        if (!this.isRunMutable(runId)) return;
+        this.activeEmailLeases.set(this.activeEmailLeaseKey(runId, workerId), {
+            pool,
+            lease,
+            mode: "return",
+        });
+    }
+
+    private markActiveEmailLeaseMode(runId: number, workerId: number, mode: ForcePauseLeaseMode): void {
+        const active = this.activeEmailLeases.get(this.activeEmailLeaseKey(runId, workerId));
+        if (!active || active.mode === "fail") return;
+        active.mode = mode;
+    }
+
+    private settleActiveEmailLease(runId: number, workerId: number): void {
+        this.activeEmailLeases.delete(this.activeEmailLeaseKey(runId, workerId));
+    }
+
+    private hardFinalizeForcePause(): void {
+        const runId = this.runId;
+        this.hardForcePausedRunId = runId;
+        this.snapshot.status = "force_paused";
+        this.snapshot.endedAt = new Date().toISOString();
+        this.snapshot.activeWorkers = 0;
+        this.snapshot.currentConcurrency = 0;
+        this.snapshot.targetConcurrency = 0;
+        this.snapshot.adaptiveReason = "force_paused";
+        this.workerSnapshots.clear();
+        this.liveAdaptiveWorkerIds.clear();
+        this.stopMemoryMonitor();
+    }
+
+    private async cleanupForcePausedLeases(): Promise<void> {
+        const runId = this.hardForcePausedRunId;
+        const entries = Array.from(this.activeEmailLeases.entries())
+            .filter(([key]) => key.startsWith(`${runId}:`));
+        for (const [key] of entries) {
+            this.activeEmailLeases.delete(key);
+        }
+        if (!entries.length) {
+            return;
+        }
+
+        let returned = 0;
+        let failed = 0;
+        let errors = 0;
+        const reason = `force_paused: ${FORCE_PAUSE_MESSAGE}`;
+        for (const [, active] of entries) {
+            try {
+                if (active.mode === "fail") {
+                    await active.pool.markFailed(active.lease, reason);
+                    failed += 1;
+                } else {
+                    await active.pool.returnToSource(active.lease);
+                    returned += 1;
+                }
+            } catch (error) {
+                errors += 1;
+                this.logger.warn(`[FreeRegister] 强制暂停清理邮箱租约失败 email=${active.lease.email}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        this.logger.warn(`[FreeRegister] 强制暂停已取消 worker 并清理邮箱租约 returned=${returned} failed=${failed} errors=${errors}`);
+    }
+
     private checkMemoryGuard(config: AppConfig): void {
         const memory = runtimeMemorySnapshot(config);
         this.snapshot.memory = memory;
@@ -996,6 +1158,9 @@ export class RegisterTaskRunner {
                 `[FreeRegister] 内存达到硬阈值，强制暂停: used=${memory.guardUsedMb}MB rss=${memory.rssMb}MB heap=${memory.heapUsedMb}/${memory.heapLimitMb}MB limit=${memory.hardLimitMb}MB`,
             );
             this.abortController?.abort();
+            this.resolveForcePause?.();
+            this.hardFinalizeForcePause();
+            void this.cleanupForcePausedLeases();
             return;
         }
 
@@ -1020,6 +1185,14 @@ export class RegisterTaskRunner {
             updatedAt: new Date().toISOString(),
         };
         this.workerSnapshots.set(workerId, withElapsed(next));
+    }
+
+    private updateWorkerForRun(runId: number, workerId: number, patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>): void {
+        if (!this.isRunMutable(runId)) return;
+        this.updateWorker(workerId, patch);
+        if (patch.stage) {
+            this.markActiveEmailLeaseMode(runId, workerId, forcePauseLeaseModeForStage(patch.stage));
+        }
     }
 
     private refreshAdaptiveControl(config: AppConfig, baselineGuardUsedMb: number, previousRpsEwma: number): number {
@@ -1066,7 +1239,7 @@ export class RegisterTaskRunner {
         return rpsEwma;
     }
 
-    private async runAdaptiveWorkers(config: AppConfig, runWorkerSafely: WorkerLoop, runState: WorkerRunState): Promise<void> {
+    private async runAdaptiveWorkers(config: AppConfig, runWorkerSafely: WorkerLoop, runState: WorkerRunState, runId: number): Promise<void> {
         const activeWorkers = new Map<number, Promise<void>>();
         const baselineGuardUsedMb = this.snapshot.memory.guardUsedMb || runtimeMemorySnapshot(config).guardUsedMb;
         const controlIntervalMs = Math.max(1000, config.run.adaptiveControlIntervalMs);
@@ -1090,15 +1263,20 @@ export class RegisterTaskRunner {
             const promise = runWorkerSafely(workerId, true)
                 .finally(() => {
                     activeWorkers.delete(workerId);
-                    this.liveAdaptiveWorkerIds.delete(workerId);
-                    this.workerSnapshots.delete(workerId);
-                    this.snapshot.currentConcurrency = activeWorkers.size;
+                    if (this.isRunMutable(runId)) {
+                        this.liveAdaptiveWorkerIds.delete(workerId);
+                        this.workerSnapshots.delete(workerId);
+                        this.snapshot.currentConcurrency = activeWorkers.size;
+                    }
                 });
             activeWorkers.set(workerId, promise);
             this.snapshot.currentConcurrency = activeWorkers.size;
         };
 
         for (;;) {
+            if (this.forcePauseRequested || !this.isRunMutable(runId)) {
+                break;
+            }
             this.checkMemoryGuard(config);
             const now = Date.now();
             if (now >= nextControlAt) {
@@ -1137,14 +1315,18 @@ export class RegisterTaskRunner {
                 }
             }
 
-            await sleepMs(ADAPTIVE_WARMUP_INTERVAL_MS);
+            await Promise.race([sleepMs(ADAPTIVE_WARMUP_INTERVAL_MS), this.waitForForcePause()]);
         }
 
+        if (this.forcePauseRequested || !this.isRunMutable(runId)) {
+            this.snapshot.currentConcurrency = 0;
+            return;
+        }
         await Promise.all(activeWorkers.values());
         this.snapshot.currentConcurrency = 0;
     }
 
-    private async run(config: AppConfig): Promise<RunnerSnapshot> {
+    private async run(config: AppConfig, runId: number): Promise<RunnerSnapshot> {
         const pool = new EmailPool(config.emailPool);
         const mode = config.run.runUntilEmpty ? "until-empty" : "fixed-total";
         const totalLabel = config.run.runUntilEmpty ? "until-empty" : String(this.snapshot.total);
@@ -1158,8 +1340,11 @@ export class RegisterTaskRunner {
 
         const worker = async (workerId: number, adaptive: boolean): Promise<void> => {
             for (;;) {
+                if (!this.isRunMutable(runId)) {
+                    return;
+                }
                 if (adaptive && runState.sourceEmpty) {
-                    this.updateWorker(workerId, {
+                    this.updateWorkerForRun(runId, workerId, {
                         status: "idle",
                         stage: "idle",
                         jobId: 0,
@@ -1170,7 +1355,7 @@ export class RegisterTaskRunner {
                     return;
                 }
                 if (this.pauseRequested || this.forcePauseRequested) {
-                    this.updateWorker(workerId, {
+                    this.updateWorkerForRun(runId, workerId, {
                         status: this.forcePauseRequested ? "force_paused" : "paused",
                         stage: this.forcePauseRequested ? "force_paused" : "idle",
                         jobId: 0,
@@ -1186,7 +1371,7 @@ export class RegisterTaskRunner {
                 }
                 const jobId = this.snapshot.nextJob;
                 if (!config.run.runUntilEmpty && jobId > this.snapshot.total) {
-                    this.updateWorker(workerId, {
+                    this.updateWorkerForRun(runId, workerId, {
                         status: "idle",
                         stage: "idle",
                         jobId: 0,
@@ -1208,8 +1393,16 @@ export class RegisterTaskRunner {
                         this.logger,
                         this.abortController?.signal,
                         () => this.pauseRequested && !this.forcePauseRequested,
-                        (patch) => this.updateWorker(workerId, patch),
+                        (patch) => this.updateWorkerForRun(runId, workerId, patch),
+                        {
+                            onEmailLeaseAcquired: (lease) => this.registerActiveEmailLease(runId, workerId, pool, lease),
+                            onEmailLeaseSettled: () => this.settleActiveEmailLease(runId, workerId),
+                            isHardForcePaused: () => !this.isRunMutable(runId),
+                        },
                     );
+                    if (!this.isRunMutable(runId)) {
+                        return;
+                    }
                     if (result.forced || result.paused) {
                         return;
                     }
@@ -1219,7 +1412,7 @@ export class RegisterTaskRunner {
                         this.snapshot.skippedCount += 1;
                         if (config.run.runUntilEmpty) {
                             runState.sourceEmpty = true;
-                            this.updateWorker(workerId, {
+                            this.updateWorkerForRun(runId, workerId, {
                                 status: "idle",
                                 stage: "idle",
                                 jobId: 0,
@@ -1233,11 +1426,13 @@ export class RegisterTaskRunner {
                         this.snapshot.failedCount += 1;
                     }
                 } finally {
-                    this.snapshot.activeWorkers = Math.max(0, this.snapshot.activeWorkers - 1);
+                    if (this.isRunMutable(runId)) {
+                        this.snapshot.activeWorkers = Math.max(0, this.snapshot.activeWorkers - 1);
+                    }
                 }
                 if (adaptive && runState.retireRequests > 0 && !this.pauseRequested && !this.forcePauseRequested && !runState.sourceEmpty) {
                     runState.retireRequests = Math.max(0, runState.retireRequests - 1);
-                    this.updateWorker(workerId, {
+                    this.updateWorkerForRun(runId, workerId, {
                         status: "idle",
                         stage: "idle",
                         jobId: 0,
@@ -1254,11 +1449,11 @@ export class RegisterTaskRunner {
             try {
                 await worker(workerId, adaptive);
             } catch (error) {
-                if (this.forcePauseRequested && isForcePauseError(error)) {
+                if (!this.isRunMutable(runId) || (this.forcePauseRequested && isForcePauseError(error))) {
                     return;
                 }
                 this.snapshot.failedCount += 1;
-                this.updateWorker(workerId, {
+                this.updateWorkerForRun(runId, workerId, {
                     status: "failed",
                     stage: "failed",
                     latestLog: error instanceof Error ? error.message : String(error),
@@ -1269,11 +1464,15 @@ export class RegisterTaskRunner {
         };
 
         if (config.run.concurrencyMode === "adaptive") {
-            await this.runAdaptiveWorkers(config, runWorkerSafely, runState);
+            await this.runAdaptiveWorkers(config, runWorkerSafely, runState, runId);
         } else {
-            await Promise.all(Array.from({length: this.snapshot.concurrency}, (_, index) => runWorkerSafely(index + 1, false)));
+            const workers = Array.from({length: this.snapshot.concurrency}, (_, index) => runWorkerSafely(index + 1, false));
+            await Promise.race([Promise.all(workers), this.waitForForcePause()]);
         }
 
+        if (!this.isRunMutable(runId)) {
+            return this.getSnapshot();
+        }
         this.snapshot.status = this.forcePauseRequested ? "force_paused" : (this.pauseRequested ? "paused" : "completed");
         if (config.run.runUntilEmpty && this.snapshot.status === "completed") {
             this.logger.info("[FreeRegister] 邮箱池已空，持续运行任务结束");
