@@ -760,10 +760,17 @@ function shouldLogPollProgress(attempt, total, every = 10) {
     return attempt === 1 || attempt === total || attempt % every === 0;
 }
 
+export function hotmailOtpResendAttempt(totalAttempts = HOTMAIL_FAST_POLL_ATTEMPTS) {
+    return Math.max(1, Math.ceil(Math.max(1, Math.floor(totalAttempts)) / 2));
+}
+
 async function pollHotmailVerificationCode(targetEmail, account, minTimestampMs = 0, options = {}) {
     const attempts = options.attempts ?? HOTMAIL_FAST_POLL_ATTEMPTS;
     const intervalMs = options.intervalMs ?? HOTMAIL_FAST_POLL_INTERVAL_MS;
     const signal = options.signal;
+    const onHalfway = options.onHalfway;
+    const resendAttempt = hotmailOtpResendAttempt(attempts);
+    let halfwayHandled = false;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
         if (signal?.aborted) return null;
@@ -784,6 +791,16 @@ async function pollHotmailVerificationCode(targetEmail, account, minTimestampMs 
         } catch (err) {
             if (logProgress) {
                 console.warn(`pollHotmailOtp: attempt=${attempt} 读邮件失败: ${(err as Error).message}`);
+            }
+        }
+        if (!halfwayHandled && onHalfway && attempt >= resendAttempt) {
+            halfwayHandled = true;
+            console.warn(`pollHotmailOtp: attempt=${attempt}/${attempts} 未收到验证码，触发一次邮箱 OTP 重发`);
+            try {
+                await onHalfway({attempt, attempts, targetEmail});
+            } catch (err) {
+                if (signal?.aborted) return null;
+                console.warn(`pollHotmailOtp: 邮箱 OTP 重发失败，继续等待: ${(err as Error).message}`);
             }
         }
         if (attempt < attempts) {
@@ -1114,6 +1131,12 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
 
             console.log(`hotmailOtp: 使用 IMAP IDLE + 快速轮询并行等待 targetEmail=${email} mailbox=${account.loginHint}`);
             const controller = new AbortController();
+            const abortFromExternalSignal = () => controller.abort();
+            if (externalSignal?.aborted) {
+                controller.abort();
+            } else {
+                externalSignal?.addEventListener("abort", abortFromExternalSignal, {once: true});
+            }
 
             try {
                 const code = await firstResolvedCode([
@@ -1128,6 +1151,7 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
                         signal: controller.signal,
                         attempts: HOTMAIL_FAST_POLL_ATTEMPTS,
                         intervalMs: HOTMAIL_FAST_POLL_INTERVAL_MS,
+                        onHalfway: options?.onHalfway,
                     }),
                 ], controller);
                 if (code) {
@@ -1136,6 +1160,7 @@ export function createHotmailProvider(options?: {lease?: EmailLease; pool?: Emai
             } catch (err) {
                 console.warn(`hotmailOtp: 并行等待失败，fallback 最后一轮轮询: ${(err as Error).message}`);
             } finally {
+                externalSignal?.removeEventListener("abort", abortFromExternalSignal);
                 controller.abort();
             }
 

@@ -4,7 +4,7 @@ import {EmailPool, type EmailLease} from "./email-pool.js";
 import {appendSuccessCostRecord} from "./cost.js";
 import {generateRandomDeviceProfile} from "./device-profile.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
-import {OpenAIClient} from "./openai.js";
+import {OpenAIClient, type FetchAddEmailOtpOptions} from "./openai.js";
 import {buildPhoneCountryProxy} from "./phone-country-proxy.js";
 import {createSMSBroker, getHeroSmsRpsStats} from "./sms/index.js";
 import {formatUtc8Timestamp} from "./utils.js";
@@ -657,7 +657,7 @@ async function bindEmailViaOAuth(
         deviceProfile: generateRandomDeviceProfile(),
         manualMode: false,
         bindEmail,
-        fetchAddEmailOtp: async () => {
+        fetchAddEmailOtp: async (otpOptions?: FetchAddEmailOtpOptions) => {
             throwIfForcePaused(signal);
             const startedAt = Date.now();
             updateWorker?.({
@@ -668,7 +668,35 @@ async function bindEmailViaOAuth(
                 latestLog: "等待邮箱 OTP",
             });
             logger.info(`[worker-${workerId}] [email] 等待 OTP for ${bindEmail} (after=${formatUtc8Timestamp(startedAt)})`);
-            const code = await hotmailProvider.getEmailVerificationCode(bindEmail, {minTimestampMs: startedAt, signal});
+            let resendAttempted = false;
+            const code = await hotmailProvider.getEmailVerificationCode(bindEmail, {
+                minTimestampMs: startedAt,
+                signal,
+                onHalfway: async () => {
+                    if (resendAttempted || !otpOptions?.resendEmailOtp) {
+                        return;
+                    }
+                    resendAttempted = true;
+                    throwIfForcePaused(signal);
+                    updateWorker?.({
+                        status: "running",
+                        stage: "email_otp_wait",
+                        email: bindEmail,
+                        phone,
+                        latestLog: "邮箱 OTP 等待过半，重发一次",
+                    });
+                    logger.warn(`[worker-${workerId}] [email] OTP 等待过半，重发一次 for ${bindEmail}`);
+                    await otpOptions.resendEmailOtp();
+                    throwIfForcePaused(signal);
+                    updateWorker?.({
+                        status: "running",
+                        stage: "email_otp_wait",
+                        email: bindEmail,
+                        phone,
+                        latestLog: "已重发邮箱 OTP，继续等待",
+                    });
+                },
+            });
             throwIfForcePaused(signal);
             updateWorker?.({
                 status: "running",

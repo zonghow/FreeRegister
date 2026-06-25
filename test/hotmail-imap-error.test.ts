@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import {EventEmitter} from "node:events";
 import test from "node:test";
-import {protectImapClient} from "../src/mail/hotmail.js";
+import {hotmailOtpResendAttempt, protectImapClient} from "../src/mail/hotmail.js";
+
+test("hotmail OTP resend is attempted halfway through polling", () => {
+    assert.equal(hotmailOtpResendAttempt(45), 23);
+    assert.equal(hotmailOtpResendAttempt(10), 5);
+    assert.equal(hotmailOtpResendAttempt(1), 1);
+});
 
 test("imap client errors reject the active operation instead of being unhandled", async () => {
     const client = new EventEmitter();

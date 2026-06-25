@@ -233,7 +233,11 @@ export interface OpenAIClientOptions {
      * 用这个 email 提交 add-email/send，并通过 fetchAddEmailOtp 接 OTP。
      */
     bindEmail?: string;
-    fetchAddEmailOtp?: () => Promise<string>;
+    fetchAddEmailOtp?: (options?: FetchAddEmailOtpOptions) => Promise<string>;
+}
+
+export interface FetchAddEmailOtpOptions {
+    resendEmailOtp?: () => Promise<void>;
 }
 
 export class OpenAIClient {
@@ -251,7 +255,7 @@ export class OpenAIClient {
     deviceID = "";
     readonly smsBroker?: ISMSActivationBroker;
     readonly bindEmail: string;
-    readonly fetchAddEmailOtp?: () => Promise<string>;
+    readonly fetchAddEmailOtp?: (options?: FetchAddEmailOtpOptions) => Promise<string>;
     readonly proxyUrl: string;
     readonly dispatcher: Dispatcher;
     readonly useBrowserSentinel: boolean;
@@ -571,7 +575,7 @@ export class OpenAIClient {
                 if (!this.fetchAddEmailOtp) {
                     throw new Error("/email-verification 但没配置 fetchAddEmailOtp");
                 }
-                const code = await this.fetchAddEmailOtp();
+                const code = await this.fetchAddEmailOtp(this.createAddEmailOtpOptions());
                 if (!code) throw new Error("add-email OTP 未提供");
                 continueURL = await this.emailOtpValidate(code);
             }
@@ -636,7 +640,7 @@ export class OpenAIClient {
                 if (!this.fetchAddEmailOtp) {
                     throw new Error("/email-verification 但未配置 fetchAddEmailOtp");
                 }
-                const code = await this.fetchAddEmailOtp();
+                const code = await this.fetchAddEmailOtp(this.createAddEmailOtpOptions());
                 if (!code) throw new Error("add-email OTP 未提供");
                 continueURL = await this.emailOtpValidate(code);
             }
@@ -1192,6 +1196,27 @@ export class OpenAIClient {
         }
         const payload = (await response.json()) as ContinueResponse;
         return payload.continue_url;
+    }
+
+    private createAddEmailOtpOptions(): FetchAddEmailOtpOptions {
+        let resendAttempted = false;
+        return {
+            resendEmailOtp: async () => {
+                if (resendAttempted) {
+                    return;
+                }
+                if (!this.bindEmail) {
+                    throw new Error("无法重发 add-email OTP：bindEmail 为空");
+                }
+                resendAttempted = true;
+                console.log(`[add-email] 邮箱 OTP 等待过半仍未收到，重发一次: ${this.bindEmail}`);
+                const continueURL = await this.sendAddEmail(this.bindEmail);
+                console.log(`[add-email] 重发 add-email/send 完成 continue_url=${continueURL}`);
+                if (continueURL !== `${AUTH_BASE_URL}/email-verification`) {
+                    throw new Error(`重发 add-email OTP 后跳转异常: ${continueURL}`);
+                }
+            },
+        };
     }
 
     async selectWorkspace(consentURL: string): Promise<string> {
