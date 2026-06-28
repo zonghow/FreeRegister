@@ -9,6 +9,7 @@ export interface RunConfig {
     maxPhoneTries: number;
     useBrowserSentinel: boolean;
     runUntilEmpty: boolean;
+    successAfterEmailOtp: boolean;
     adaptiveTargetSmsRpsUtilization: number;
     adaptiveControlIntervalMs: number;
     memorySoftLimitMb: number;
@@ -107,6 +108,7 @@ const DEFAULT_CONFIG: AppConfig = {
         maxPhoneTries: 20,
         useBrowserSentinel: false,
         runUntilEmpty: false,
+        successAfterEmailOtp: false,
         adaptiveTargetSmsRpsUtilization: 0.9,
         adaptiveControlIntervalMs: 5000,
         memorySoftLimitMb: 0,
@@ -409,6 +411,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
             maxPhoneTries: maxPhoneTries ?? config.run.maxPhoneTries,
             useBrowserSentinel: useBrowserSentinel ?? config.run.useBrowserSentinel,
             runUntilEmpty: runUntilEmpty ?? config.run.runUntilEmpty,
+            successAfterEmailOtp: config.run.successAfterEmailOtp,
         },
         heroSMS: {
             ...config.heroSMS,
@@ -499,6 +502,7 @@ export function loadConfig(configPath = resolveConfigPath()): AppConfig {
             maxPhoneTries: runMaxPhoneTries,
             useBrowserSentinel: booleanValue(run.use_browser_sentinel, DEFAULT_CONFIG.run.useBrowserSentinel),
             runUntilEmpty: booleanValue(run.run_until_empty, DEFAULT_CONFIG.run.runUntilEmpty),
+            successAfterEmailOtp: booleanValue(run.success_after_email_otp, DEFAULT_CONFIG.run.successAfterEmailOtp),
             adaptiveTargetSmsRpsUtilization: boundedNumber(
                 numberValue(run.adaptive_target_sms_rps_utilization, DEFAULT_CONFIG.run.adaptiveTargetSmsRpsUtilization),
                 DEFAULT_CONFIG.run.adaptiveTargetSmsRpsUtilization,

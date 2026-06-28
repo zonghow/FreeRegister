@@ -158,6 +158,7 @@ total = 1
 concurrency = 1
 use_browser_sentinel = false
 run_until_empty = false
+success_after_email_otp = false
 
 [openai]
 default_password = "change-this-password"
@@ -230,6 +231,8 @@ adaptive_control_interval_ms = 5000
 自适应模式会 warm-up 分批启动 worker，并按内存估算最大并发；缩容时只是不再给多余 worker 派新 job，不会中断已经开始的注册流程。
 
 当某个 key 的取号请求返回余额不足类错误，或后台余额刷新发现该 key 余额 `<= 0` 时，程序会在当前进程内停用这个 key 并继续尝试其它 key。后续如果充值了，手动刷新余额且余额大于 0，会自动恢复因 `no_balance` 停用的 key；`BAD_KEY` 这类错误不会被余额刷新自动恢复。
+
+`success_after_email_otp = true` 时，Codex OAuth 流程会在 add-email 邮箱 OTP 验证成功后就把任务记为成功，不再继续 workspace consent、callback、code 换 token 和 CPA JSON 保存。这个模式适合只需要确认邮箱已绑上的场景；成功导出包里对应账号可能没有 CPA JSON。
 
 网页后台的国家选项会优先从 HeroSMS `getCountries` 接口获取，并永久缓存到 `.cache/hero-sms-countries.json`；接口失败时会继续使用旧缓存，没有缓存时才切换到内置兜底列表。点击“重新加载”会主动刷新这份缓存。
 

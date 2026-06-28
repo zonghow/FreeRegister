@@ -188,6 +188,7 @@ export interface AuthLoginResult {
     code: string;
     state: string;
     authFile?: string;
+    completedAfterEmailOtp?: boolean;
 }
 
 interface ChatGPTAuthSession {
@@ -228,6 +229,7 @@ export interface OpenAIClientOptions {
     authJsonDir?: string;
     abortSignal?: AbortSignal;
     fetchTimeoutMs?: number;
+    completeAfterAddEmailOtp?: boolean;
     /**
      * 当 OAuth 登录流程要求 add-email（phone-only 账号 codex CLI OAuth）时，
      * 用这个 email 提交 add-email/send，并通过 fetchAddEmailOtp 接 OTP。
@@ -264,6 +266,7 @@ export class OpenAIClient {
     readonly authJsonDir: string;
     readonly abortSignal?: AbortSignal;
     readonly fetchTimeoutMs: number;
+    readonly completeAfterAddEmailOtp: boolean;
 
     constructor(options: OpenAIClientOptions) {
         this.smsBroker = options.smsBroker;
@@ -276,6 +279,7 @@ export class OpenAIClient {
         this.authJsonDir = options.authJsonDir?.trim() || "auth";
         this.abortSignal = options.abortSignal;
         this.fetchTimeoutMs = normalizeFetchTimeoutMs(options.fetchTimeoutMs);
+        this.completeAfterAddEmailOtp = options.completeAfterAddEmailOtp ?? false;
         this.email = options.email?.trim() ?? "";
         this.password = options.password;
         this.deviceProfile = options.deviceProfile
@@ -578,6 +582,15 @@ export class OpenAIClient {
                 const code = await this.fetchAddEmailOtp(this.createAddEmailOtpOptions());
                 if (!code) throw new Error("add-email OTP 未提供");
                 continueURL = await this.emailOtpValidate(code);
+                if (this.completeAfterAddEmailOtp) {
+                    return {
+                        callbackURL: continueURL,
+                        code: "",
+                        state: this.state,
+                        authFile: "",
+                        completedAfterEmailOtp: true,
+                    };
+                }
             }
             if (continueURL === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
                 continueURL = await this.selectWorkspace(continueURL);

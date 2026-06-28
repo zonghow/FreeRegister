@@ -13,6 +13,7 @@ concurrency = 10
 concurrency_mode = "adaptive"
 use_browser_sentinel = true
 run_until_empty = true
+success_after_email_otp = true
 adaptive_target_sms_rps_utilization = 0.95
 adaptive_control_interval_ms = 2000
 
@@ -42,6 +43,7 @@ auto_release_on_timeout = true
     assert.equal(parsed.run.concurrency_mode, "adaptive");
     assert.equal(parsed.run.use_browser_sentinel, true);
     assert.equal(parsed.run.run_until_empty, true);
+    assert.equal(parsed.run.success_after_email_otp, true);
     assert.equal(parsed.run.adaptive_target_sms_rps_utilization, 0.95);
     assert.equal(parsed.run.adaptive_control_interval_ms, 2000);
     assert.equal(parsed.proxies.mode, "phone_country");
@@ -70,6 +72,7 @@ concurrency = 1
 concurrency_mode = "adaptive"
 max_phone_tries = 7
 run_until_empty = false
+success_after_email_otp = true
 adaptive_target_sms_rps_utilization = 0.95
 adaptive_control_interval_ms = 2500
 memory_soft_limit_mb = 7000
@@ -125,6 +128,7 @@ file = "custom-sdk.js"
         assert.equal(overridden.run.concurrency, 3);
         assert.equal(overridden.run.concurrencyMode, "adaptive");
         assert.equal(overridden.run.maxPhoneTries, 7);
+        assert.equal(overridden.run.successAfterEmailOtp, true);
         assert.equal(overridden.run.adaptiveTargetSmsRpsUtilization, 0.95);
         assert.equal(overridden.run.adaptiveControlIntervalMs, 2500);
         assert.equal(overridden.run.memorySoftLimitMb, 7000);

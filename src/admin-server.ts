@@ -1104,6 +1104,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const priceStep = numberFromBody(body.priceStep, hero.priceStep);
         const runValues = {
             concurrency_mode: runConcurrencyModeFromBody(body.concurrencyMode, config.run.concurrencyMode),
+            success_after_email_otp: Boolean(body.successAfterEmailOtp),
         };
         const proxyValues = {
             mode: proxyModeFromBody(body.proxyMode, config.proxy.mode),
@@ -1408,6 +1409,7 @@ function html(): string {
             <option value="fixed">fixed</option>
             <option value="adaptive">adaptive</option>
           </select></label>
+          <label><span>邮箱 OTP 后成功</span><span class="check-row"><input id="successAfterEmailOtp" type="checkbox">开启</span></label>
           <label><span>注册代理模式</span><select id="proxyMode">
             <option value="pool">代理池</option>
             <option value="phone_country">手机号国家</option>
@@ -1940,6 +1942,7 @@ function html(): string {
         setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
       }
       if (data.run) $("runConcurrencyMode").value = data.run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+      if (data.run) $("successAfterEmailOtp").checked = data.run.successAfterEmailOtp === true;
       fillProxyForm(data.proxy || {});
       fillSmsForm(data.heroSMS || {});
       state.smsConfigDirty = false;
@@ -1949,6 +1952,7 @@ function html(): string {
     function smsPayloadFromForm() {
       return {
         concurrencyMode: $("runConcurrencyMode").value,
+        successAfterEmailOtp: $("successAfterEmailOtp").checked,
         proxyMode: $("proxyMode").value,
         phoneCountryTemplate: $("phoneCountryTemplate").value,
         countries: state.selectedSmsCountries,
@@ -1999,10 +2003,12 @@ function html(): string {
         const concurrencyMode = (runner.concurrencyMode || run.concurrencyMode) === "adaptive" ? "adaptive" : "fixed";
         if (!state.smsConfigDirty) {
           $("runConcurrencyMode").value = run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+          $("successAfterEmailOtp").checked = run.successAfterEmailOtp === true;
           fillProxyForm(proxy);
         }
         const proxyMode = normalizeProxyMode(proxy) === "phone_country" ? "手机号国家代理" : "代理池";
-        const parts = ["模式 " + mode, "并发 " + concurrencyMode, "注册代理 " + proxyMode, "total " + run.total, "concurrency " + run.concurrency];
+        const otpMode = run.successAfterEmailOtp === true ? "邮箱OTP即成功" : "完整OAuth";
+        const parts = ["模式 " + mode, "并发 " + concurrencyMode, "OAuth " + otpMode, "注册代理 " + proxyMode, "total " + run.total, "concurrency " + run.concurrency];
         if (concurrencyMode === "adaptive") {
           parts.push("worker " + Number(runner.currentConcurrency || 0) + "/" + Number(runner.targetConcurrency || 0) + "/max " + Number(runner.maxConcurrency || 0));
           parts.push("HeroSMS " + formatRpsAmount(runner.adaptiveSmsRps || 0) + "/" + Number(runner.adaptiveSmsRpsLimit || 0) + " target " + formatPercent(runner.adaptiveTargetSmsRpsUtilization || run.adaptiveTargetSmsRpsUtilization || 0));
@@ -2272,7 +2278,7 @@ function html(): string {
       (result) => "已标记失败 " + (result.failed || 0) + " 个，清理进行中 " + (result.cleared || 0) + " 个",
     );
 
-    ["runConcurrencyMode", "proxyMode", "phoneCountryTemplate", "smsProxyStrategy", "smsApiKeyStrategy", "smsAcquirePriority", "smsMinPrice", "smsMaxPrice", "smsPriceStep", "smsMaxPhoneTries"].forEach((id) => {
+    ["runConcurrencyMode", "successAfterEmailOtp", "proxyMode", "phoneCountryTemplate", "smsProxyStrategy", "smsApiKeyStrategy", "smsAcquirePriority", "smsMinPrice", "smsMaxPrice", "smsPriceStep", "smsMaxPhoneTries"].forEach((id) => {
       $(id).addEventListener("input", markSmsConfigDirty);
       $(id).addEventListener("change", markSmsConfigDirty);
     });

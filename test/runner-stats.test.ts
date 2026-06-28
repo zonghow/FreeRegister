@@ -29,6 +29,7 @@ function testConfig(dir: string): AppConfig {
             maxPhoneTries: 20,
             useBrowserSentinel: false,
             runUntilEmpty: false,
+            successAfterEmailOtp: false,
             adaptiveTargetSmsRpsUtilization: 0.9,
             adaptiveControlIntervalMs: 1000,
             memorySoftLimitMb: 0,

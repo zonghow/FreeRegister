@@ -34,6 +34,8 @@ test("sms config UI hides advanced HeroSMS fields", async () => {
     assert.match(source, /<h2>接码配置<\/h2>/);
     assert.match(source, /<h2>配置操作<\/h2>/);
     assert.match(source, /id="runConcurrencyMode"/);
+    assert.match(source, /id="successAfterEmailOtp"/);
+    assert.match(source, /邮箱 OTP 后成功/);
     assert.match(source, /id="proxyMode"/);
     assert.match(source, /id="phoneCountryTemplate"/);
     assert.match(source, /手机号国家代理模板/);
@@ -82,6 +84,7 @@ test("sms config save payload preserves hidden config fields", async () => {
         assert.doesNotMatch(payloadSource, new RegExp(`${hiddenField}\\s*:`));
     }
     assert.match(payloadSource, /concurrencyMode\s*:/);
+    assert.match(payloadSource, /successAfterEmailOtp\s*:/);
     assert.match(payloadSource, /proxyMode\s*:/);
     assert.match(payloadSource, /phoneCountryTemplate\s*:/);
     assert.match(payloadSource, /apiKeyStrategy\s*:/);
@@ -91,7 +94,7 @@ test("sms config save payload preserves hidden config fields", async () => {
     }
 });
 
-test("sms config save also persists only the run concurrency mode", async () => {
+test("sms config save persists only visible run mode fields", async () => {
     const source = await adminSource();
     const handlerStart = source.indexOf("pathname === \"/api/sms-config\" && req.method === \"PUT\"");
     const handlerEnd = source.indexOf("pathname === \"/api/email/import\"", handlerStart);
@@ -101,6 +104,7 @@ test("sms config save also persists only the run concurrency mode", async () => 
     const runValuesSource = handlerSource.slice(runValuesStart, runValuesEnd);
 
     assert.match(runValuesSource, /concurrency_mode\s*:/);
+    assert.match(runValuesSource, /success_after_email_otp\s*:/);
     assert.match(runValuesSource, /runConcurrencyModeFromBody/);
     assert.match(handlerSource, /upsertTomlSection\(content,\s*"run",\s*runValues\)/);
     assert.match(handlerSource, /const proxyValues = \{/);

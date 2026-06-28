@@ -7,6 +7,8 @@ concurrency = 1
 concurrency_mode = "fixed"
 use_browser_sentinel = false
 run_until_empty = false
+# true 时 add-email 邮箱 OTP 验证成功后即把任务算成功，不再交换 Codex token，也不会生成 CPA JSON。
+success_after_email_otp = false
 # adaptive 模式下尽量贴近 HeroSMS 总 RPS 上限的目标利用率；0.9 表示 90%。
 adaptive_target_sms_rps_utilization = 0.9
 adaptive_control_interval_ms = 5000

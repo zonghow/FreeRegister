@@ -713,6 +713,7 @@ async function bindEmailViaOAuth(
         saveAuthJson: true,
         authJsonDir: config.cpaJson.dir,
         abortSignal: signal,
+        completeAfterAddEmailOtp: config.run.successAfterEmailOtp,
     });
 
     updateWorker?.({
@@ -725,14 +726,17 @@ async function bindEmailViaOAuth(
     try {
         const authResult = await oauthClient.authLoginHTTP();
         throwIfForcePaused(signal);
+        const authSummary = authResult.completedAfterEmailOtp
+            ? "邮箱 OTP 已验证，按配置提前完成"
+            : `OAuth 完成 cpa_json=${authResult.authFile || "not-saved"}`;
         updateWorker?.({
             status: "running",
             stage: "oauth_exchange",
             email: bindEmail,
             phone,
-            latestLog: `OAuth 完成 cpa_json=${authResult.authFile || "not-saved"}`,
+            latestLog: authSummary,
         });
-        logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} cpa_json=${authResult.authFile || "not-saved"}`);
+        logger.info(`[worker-${workerId}] [oauth] 完成 phone=${phone} email=${bindEmail} ${authSummary}`);
     } finally {
         try {
             await oauthClient.close();
