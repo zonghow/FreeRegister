@@ -116,6 +116,7 @@ const ADAPTIVE_WARMUP_INTERVAL_MS = 250;
 const ADAPTIVE_EWMA_ALPHA = 0.35;
 const ADAPTIVE_DEFAULT_WORKER_MB = 64;
 const ADAPTIVE_MIN_WORKER_MB = 16;
+const MAX_BIND_EMAIL_TRIES = 5;
 const MB = 1024 * 1024;
 
 function bytesToMb(bytes: number): number {
@@ -398,11 +399,33 @@ export function computeAdaptiveTargetConcurrency(input: AdaptiveTargetInput): Ad
 type WorkerUpdate = (patch: Partial<Omit<WorkerSnapshot, "workerId" | "elapsedMs">>) => void;
 type WorkerLoop = (workerId: number, adaptive: boolean) => Promise<void>;
 type ForcePauseLeaseMode = "return" | "fail";
+type PhoneSignupResult = {phone: string; proxyUrl: string; smsCost: number; smsGrossCost: number; smsRefundCost: number};
+type PhoneSignupFn = (
+    config: AppConfig,
+    workerId: number,
+    logger: RegisterLogger,
+    signal?: AbortSignal,
+    shouldPause?: () => boolean,
+    updateWorker?: WorkerUpdate,
+) => Promise<PhoneSignupResult>;
+type BindEmailFn = (
+    config: AppConfig,
+    pool: EmailPool,
+    lease: EmailLease,
+    phone: string,
+    proxyUrl: string,
+    workerId: number,
+    logger: RegisterLogger,
+    signal?: AbortSignal,
+    updateWorker?: WorkerUpdate,
+) => Promise<void>;
 
 interface RunOneHooks {
     onEmailLeaseAcquired?: (lease: EmailLease) => void;
     onEmailLeaseSettled?: () => void;
     isHardForcePaused?: () => boolean;
+    phoneSignup?: PhoneSignupFn;
+    bindEmailViaOAuth?: BindEmailFn;
 }
 
 interface ActiveEmailLease {
@@ -476,6 +499,19 @@ function isEmailTouchedError(error: unknown): boolean {
     return /add-email|email-verification|email_already_in_use|Hotmail|邮箱|OTP/i.test(message);
 }
 
+export function isRetryableBindEmailError(error: unknown): boolean {
+    if (isForcePauseError(error) || isPauseError(error)) {
+        return false;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return /add-email|email-verification|EmailOtpValidate|SendAddEmail|Hotmail|邮箱|OTP|email_already_in_use|email_in_use|wrong_email_otp_code|OpenAI fetch 请求超时|fetch failed/i.test(message);
+}
+
+function bindEmailFailureReason(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return isEmailTouchedError(error) ? message : `oauth_uncertain: ${message}`;
+}
+
 async function phoneSignup(
     config: AppConfig,
     workerId: number,
@@ -483,7 +519,7 @@ async function phoneSignup(
     signal?: AbortSignal,
     shouldPause?: () => boolean,
     updateWorker?: WorkerUpdate,
-): Promise<{phone: string; proxyUrl: string; smsCost: number; smsGrossCost: number; smsRefundCost: number}> {
+): Promise<PhoneSignupResult> {
     const smsProxyUrl = heroSmsProxyForWorker(config, workerId - 1);
     const poolProxyUrl = proxyForWorker(config, workerId - 1);
     const smsBroker = createBroker(config, smsProxyUrl);
@@ -776,8 +812,8 @@ export async function runOne(
         `\n========== [job ${jobId}/${totalLabel}] worker=${workerId} proxyMode=${config.proxy.mode} proxy=${config.proxy.mode === "phone_country" ? "pending-phone-country" : redactProxy(proxyUrl)} heroSmsProxy=${redactProxy(smsProxyUrl)} ==========`,
     );
 
-    const emailLease = await pool.leaseEmail();
-    if (!emailLease) {
+    const initialEmailLease = await pool.leaseEmail();
+    if (!initialEmailLease) {
         updateWorker?.({
             status: "skipped",
             stage: "skipped",
@@ -786,10 +822,18 @@ export async function runOne(
         logger.warn(`[worker-${workerId}] 邮箱池为空，跳过 job=${jobId}`);
         return {ok: false, skipped: true};
     }
+    let emailLease: EmailLease = initialEmailLease;
     hooks.onEmailLeaseAcquired?.(emailLease);
     const settleEmailLease = async (operation: () => Promise<void>): Promise<void> => {
         await operation();
         hooks.onEmailLeaseSettled?.();
+    };
+    const leaseNextEmail = async (): Promise<EmailLease | null> => {
+        const nextLease = await pool.leaseEmail();
+        if (nextLease) {
+            hooks.onEmailLeaseAcquired?.(nextLease);
+        }
+        return nextLease;
     };
     if (hooks.isHardForcePaused?.() || signal?.aborted) {
         await settleEmailLease(() => pool.returnToSource(emailLease));
@@ -808,7 +852,7 @@ export async function runOne(
     let smsGrossCost = 0;
     let smsRefundCost = 0;
     try {
-        const signup = await phoneSignup(config, workerId, logger, signal, shouldPause, updateWorker);
+        const signup = await (hooks.phoneSignup ?? phoneSignup)(config, workerId, logger, signal, shouldPause, updateWorker);
         if (hooks.isHardForcePaused?.() || signal?.aborted) {
             updateWorker?.({
                 status: "force_paused",
@@ -860,68 +904,126 @@ export async function runOne(
         return {ok: false};
     }
 
-    try {
-        await bindEmailViaOAuth(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal, updateWorker);
-        if (hooks.isHardForcePaused?.() || signal?.aborted) {
-            throw createForcePauseError();
-        }
-        await settleEmailLease(() => pool.markSuccess(emailLease));
+    const bindEmail = hooks.bindEmailViaOAuth ?? bindEmailViaOAuth;
+    for (let emailTry = 1; emailTry <= MAX_BIND_EMAIL_TRIES; emailTry += 1) {
         try {
-            const costRecord = await appendSuccessCostRecord(config.cost, {
+            if (emailTry > 1) {
+                updateWorker?.({
+                    status: "running",
+                    stage: "oauth_start",
+                    email: emailLease.email,
+                    phone,
+                    latestLog: `换邮箱重试 (${emailTry}/${MAX_BIND_EMAIL_TRIES}): ${emailLease.email}`,
+                    error: "",
+                });
+                logger.info(`[worker-${workerId}] [email] 换邮箱重试 (${emailTry}/${MAX_BIND_EMAIL_TRIES}): ${emailLease.email}`);
+            }
+            await bindEmail(config, pool, emailLease, phone, proxyUrl, workerId, logger, signal, updateWorker);
+            if (hooks.isHardForcePaused?.() || signal?.aborted) {
+                throw createForcePauseError();
+            }
+            await settleEmailLease(() => pool.markSuccess(emailLease));
+            try {
+                const costRecord = await appendSuccessCostRecord(config.cost, {
+                    email: emailLease.email,
+                    phone,
+                    emailCost: config.cost.emailUnitCost,
+                    smsCost,
+                    smsGrossCost,
+                    smsRefundCost,
+                    currency: config.cost.currency,
+                });
+                logger.info(`[worker-${workerId}] [cost] email=${emailLease.email} sms_gross=${costRecord.smsGrossCost} sms_refund=${costRecord.smsRefundCost} sms=${costRecord.smsCost} email_cost=${costRecord.emailCost} total=${costRecord.totalCost} ${costRecord.currency}`);
+            } catch (costError) {
+                logger.warn(`[worker-${workerId}] [cost] 成本流水写入失败，不影响成功结果: ${(costError as Error).message}`);
+            }
+            updateWorker?.({
+                status: "success",
+                stage: "success",
                 email: emailLease.email,
                 phone,
-                emailCost: config.cost.emailUnitCost,
-                smsCost,
-                smsGrossCost,
-                smsRefundCost,
-                currency: config.cost.currency,
+                latestLog: `成功 phone=${phone} email=${emailLease.email}`,
+                error: "",
             });
-            logger.info(`[worker-${workerId}] [cost] email=${emailLease.email} sms_gross=${costRecord.smsGrossCost} sms_refund=${costRecord.smsRefundCost} sms=${costRecord.smsCost} email_cost=${costRecord.emailCost} total=${costRecord.totalCost} ${costRecord.currency}`);
-        } catch (costError) {
-            logger.warn(`[worker-${workerId}] [cost] 成本流水写入失败，不影响成功结果: ${(costError as Error).message}`);
-        }
-        updateWorker?.({
-            status: "success",
-            stage: "success",
-            email: emailLease.email,
-            phone,
-            latestLog: `成功 phone=${phone} email=${emailLease.email}`,
-            error: "",
-        });
-        logger.info(`[worker-${workerId}] [success] phone=${phone} email=${emailLease.email}`);
-        logger.info(`[POOL-RESULT] status=ok phone=${phone} email=${emailLease.email}`);
-        return {ok: true};
-    } catch (error) {
-        if (signal?.aborted) {
-            const reason = `force_paused: ${FORCE_PAUSE_MESSAGE}`;
+            logger.info(`[worker-${workerId}] [success] phone=${phone} email=${emailLease.email}`);
+            logger.info(`[POOL-RESULT] status=ok phone=${phone} email=${emailLease.email}`);
+            return {ok: true};
+        } catch (error) {
+            if (signal?.aborted) {
+                const reason = `force_paused: ${FORCE_PAUSE_MESSAGE}`;
+                updateWorker?.({
+                    status: "force_paused",
+                    stage: "force_paused",
+                    email: emailLease.email,
+                    phone,
+                    latestLog: reason,
+                    error: reason,
+                });
+                logger.warn(`[worker-${workerId}] [force-pause] email=${emailLease.email} reason=${reason}`);
+                await settleEmailLease(() => pool.markFailed(emailLease, reason));
+                logger.info(`[POOL-RESULT] status=force-paused phone=${phone} email=${emailLease.email}`);
+                return {ok: false, forced: true};
+            }
+
+            const reason = bindEmailFailureReason(error);
+            const shouldRetryEmail = isRetryableBindEmailError(error) && emailTry < MAX_BIND_EMAIL_TRIES;
+            if (shouldRetryEmail) {
+                updateWorker?.({
+                    status: "running",
+                    stage: "oauth_start",
+                    email: emailLease.email,
+                    phone,
+                    latestLog: `邮箱绑定失败，换邮箱重试 (${emailTry}/${MAX_BIND_EMAIL_TRIES}): ${reason}`,
+                    error: reason,
+                });
+                logger.warn(`[worker-${workerId}] [email] 绑定失败，标记邮箱失败并换邮箱 (${emailTry}/${MAX_BIND_EMAIL_TRIES}) email=${emailLease.email} reason=${reason}`);
+                await settleEmailLease(() => pool.markFailed(emailLease, reason));
+
+                const nextLease = await leaseNextEmail();
+                if (!nextLease) {
+                    const emptyReason = `邮箱绑定失败且邮箱池为空，手机号未完成绑定: ${reason}`;
+                    updateWorker?.({
+                        status: "failed",
+                        stage: "failed",
+                        email: "",
+                        phone,
+                        latestLog: emptyReason,
+                        error: emptyReason,
+                    });
+                    logger.warn(`[worker-${workerId}] [failed] phone=${phone} reason=${emptyReason}`);
+                    logger.info(`[POOL-RESULT] status=failed phone=${phone} email=${emailLease.email}`);
+                    return {ok: false};
+                }
+
+                emailLease = nextLease;
+                updateWorker?.({
+                    status: "running",
+                    stage: "oauth_start",
+                    email: emailLease.email,
+                    phone,
+                    latestLog: `已租约新邮箱 ${emailLease.email}`,
+                    error: "",
+                });
+                logger.info(`[worker-${workerId}] [email] 已租约新邮箱 ${emailLease.email}`);
+                continue;
+            }
+
             updateWorker?.({
-                status: "force_paused",
-                stage: "force_paused",
+                status: "failed",
+                stage: "failed",
                 email: emailLease.email,
                 phone,
                 latestLog: reason,
                 error: reason,
             });
-            logger.warn(`[worker-${workerId}] [force-pause] email=${emailLease.email} reason=${reason}`);
+            logger.warn(`[worker-${workerId}] [failed] email=${emailLease.email} reason=${reason}`);
             await settleEmailLease(() => pool.markFailed(emailLease, reason));
-            logger.info(`[POOL-RESULT] status=force-paused phone=${phone} email=${emailLease.email}`);
-            return {ok: false, forced: true};
+            logger.info(`[POOL-RESULT] status=failed phone=${phone} email=${emailLease.email}`);
+            return {ok: false};
         }
-        const message = error instanceof Error ? error.message : String(error);
-        const reason = isEmailTouchedError(error) ? message : `oauth_uncertain: ${message}`;
-        updateWorker?.({
-            status: "failed",
-            stage: "failed",
-            email: emailLease.email,
-            phone,
-            latestLog: reason,
-            error: reason,
-        });
-        logger.warn(`[worker-${workerId}] [failed] email=${emailLease.email} reason=${reason}`);
-        await settleEmailLease(() => pool.markFailed(emailLease, reason));
-        logger.info(`[POOL-RESULT] status=failed phone=${phone} email=${emailLease.email}`);
-        return {ok: false};
     }
+
+    return {ok: false};
 }
 
 export class RegisterTaskRunner {

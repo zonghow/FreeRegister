@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {mkdtemp, rm} from "node:fs/promises";
+import {mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,10 +11,12 @@ import {
     estimateAdaptiveSmsRpsConcurrencyCap,
     filterVisibleWorkerSnapshots,
     RegisterTaskRunner,
+    runOne,
     shouldStopPhoneRetryForPause,
     type RunnerStatus,
     type WorkerSnapshot,
 } from "../src/runner.js";
+import {EmailPool, type EmailLease} from "../src/email-pool.js";
 
 function snapshot(status: RunnerStatus, startedAt: string, endedAt: string, okCount: number) {
     return {status, startedAt, endedAt, okCount};
@@ -90,6 +92,19 @@ function testConfig(dir: string): AppConfig {
         defaultProxyUrl: "",
         defaultPassword: "pw",
     };
+}
+
+function fakeEmailLine(index: number): string {
+    return `user${index}@outlook.com----pw${index}----client${index}----refresh${index}`;
+}
+
+async function poolLines(filePath: string): Promise<string[]> {
+    try {
+        const raw = await readFile(filePath, "utf8");
+        return raw.split(/\r?\n/).filter(Boolean).filter((line) => !line.startsWith("#"));
+    } catch {
+        return [];
+    }
 }
 
 test("runner throughput uses current time while task is active", () => {
@@ -269,6 +284,108 @@ test("normal pause stops phone retry without taking the force-pause path", () =>
     assert.equal(shouldStopPhoneRetryForPause(false), false);
     assert.equal(shouldStopPhoneRetryForPause(true), true);
     assert.equal(shouldStopPhoneRetryForPause(true, AbortSignal.abort()), false);
+});
+
+test("runOne retries a new email after retryable bind failures on the same phone", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-email-retry-"));
+    const config = testConfig(dir);
+    const pool = new EmailPool(config.emailPool);
+    const attempts: string[] = [];
+    let acquired = 0;
+    let settled = 0;
+
+    try {
+        await writeFile(
+            config.emailPool.source,
+            [1, 2, 3, 4].map(fakeEmailLine).join("\n") + "\n",
+        );
+
+        const result = await runOne(
+            config,
+            pool,
+            1,
+            1,
+            {info() {}, warn() {}, error() {}},
+            undefined,
+            undefined,
+            undefined,
+            {
+                onEmailLeaseAcquired: () => { acquired += 1; },
+                onEmailLeaseSettled: () => { settled += 1; },
+                phoneSignup: async () => ({
+                    phone: "+15550000001",
+                    proxyUrl: "direct",
+                    smsCost: 0.1,
+                    smsGrossCost: 0.1,
+                    smsRefundCost: 0,
+                }),
+                bindEmailViaOAuth: async (_config, _pool, lease: EmailLease) => {
+                    attempts.push(lease.email);
+                    if (attempts.length < 3) {
+                        throw new Error("EmailOtpValidate请求失败: 403 code=email_already_in_use");
+                    }
+                },
+            },
+        );
+
+        assert.equal(result.ok, true);
+        assert.deepEqual(attempts, ["user1@outlook.com", "user2@outlook.com", "user3@outlook.com"]);
+        assert.equal(acquired, 3);
+        assert.equal(settled, 3);
+        assert.deepEqual(await poolLines(config.emailPool.failed), [fakeEmailLine(1), fakeEmailLine(2)]);
+        assert.deepEqual(await poolLines(config.emailPool.success), [fakeEmailLine(3)]);
+        assert.deepEqual(await poolLines(config.emailPool.source), [fakeEmailLine(4)]);
+        assert.deepEqual(await poolLines(config.emailPool.inflight), []);
+    } finally {
+        await rm(dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    }
+});
+
+test("runOne gives up after five retryable bind-email failures", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-email-retry-limit-"));
+    const config = testConfig(dir);
+    const pool = new EmailPool(config.emailPool);
+    const attempts: string[] = [];
+
+    try {
+        await writeFile(
+            config.emailPool.source,
+            [1, 2, 3, 4, 5, 6].map(fakeEmailLine).join("\n") + "\n",
+        );
+
+        const result = await runOne(
+            config,
+            pool,
+            1,
+            1,
+            {info() {}, warn() {}, error() {}},
+            undefined,
+            undefined,
+            undefined,
+            {
+                phoneSignup: async () => ({
+                    phone: "+15550000001",
+                    proxyUrl: "direct",
+                    smsCost: 0.1,
+                    smsGrossCost: 0.1,
+                    smsRefundCost: 0,
+                }),
+                bindEmailViaOAuth: async (_config, _pool, lease: EmailLease) => {
+                    attempts.push(lease.email);
+                    throw new Error("EmailOtpValidate请求失败: 403 code=email_already_in_use");
+                },
+            },
+        );
+
+        assert.equal(result.ok, false);
+        assert.equal(attempts.length, 5);
+        assert.deepEqual(await poolLines(config.emailPool.failed), [1, 2, 3, 4, 5].map(fakeEmailLine));
+        assert.deepEqual(await poolLines(config.emailPool.success), []);
+        assert.deepEqual(await poolLines(config.emailPool.source), [fakeEmailLine(6)]);
+        assert.deepEqual(await poolLines(config.emailPool.inflight), []);
+    } finally {
+        await rm(dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    }
 });
 
 test("force pause immediately makes the runner terminal", async () => {
