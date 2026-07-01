@@ -54,6 +54,7 @@ const HERO_SMS_BALANCE_TIMEOUT_MS = 5000;
 const HERO_SMS_COUNTRIES_TIMEOUT_MS = 10000;
 const HERO_SMS_COUNTRIES_CACHE_VERSION = 1;
 const HERO_SMS_COUNTRIES_CACHE_FILE = path.join(".cache", "hero-sms-countries.json");
+const SUCCESS_EXPORT_SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const VENDOR_ASSETS: Record<string, {file: string; contentType: string}> = {
     "/vendor/codemirror/codemirror.css": {
         file: "node_modules/codemirror/lib/codemirror.css",
@@ -85,6 +86,14 @@ const HERO_SMS_FALLBACK_COUNTRIES = [
     {id: 182, label: "日本 (Japan)"},
     {id: 187, label: "美国（物理) (USA)"},
 ];
+
+interface SuccessExportSnapshot {
+    emails: string[];
+    createdAt: number;
+    expiresAt: number;
+}
+
+const successExportSnapshots = new Map<string, SuccessExportSnapshot>();
 
 class LogBuffer implements RegisterLogger {
     private readonly lines: LogEntry[] = [];
@@ -959,6 +968,50 @@ async function buildSuccessExportZip(successLines: string[], cpaJsonDir: string,
     return {buffer, matched: cpaFiles.size, missing};
 }
 
+function formatSuccessExportFileName(count: number, value: Date | number | string = new Date()): string {
+    const date = value instanceof Date ? value : new Date(value);
+    const timestamp = date.getTime();
+    const safeCount = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
+    if (!Number.isFinite(timestamp)) {
+        return `${safeCount}-0000-000000.zip`;
+    }
+
+    const shifted = new Date(timestamp + 8 * 60 * 60 * 1000);
+    const pad = (item: number) => String(item).padStart(2, "0");
+    const monthDay = `${pad(shifted.getUTCMonth() + 1)}${pad(shifted.getUTCDate())}`;
+    const clock = `${pad(shifted.getUTCHours())}${pad(shifted.getUTCMinutes())}${pad(shifted.getUTCSeconds())}`;
+    return `${safeCount}-${monthDay}-${clock}.zip`;
+}
+
+function cleanupSuccessExportSnapshots(now = Date.now()): void {
+    for (const [id, snapshot] of successExportSnapshots) {
+        if (snapshot.expiresAt <= now) {
+            successExportSnapshots.delete(id);
+        }
+    }
+}
+
+function createSuccessExportSnapshot(emails: string[]): string {
+    const now = Date.now();
+    cleanupSuccessExportSnapshots(now);
+    const exportId = randomBytes(16).toString("hex");
+    successExportSnapshots.set(exportId, {
+        emails: [...emails],
+        createdAt: now,
+        expiresAt: now + SUCCESS_EXPORT_SNAPSHOT_TTL_MS,
+    });
+    return exportId;
+}
+
+function getSuccessExportSnapshot(exportId: unknown): {id: string; snapshot: SuccessExportSnapshot} | null {
+    cleanupSuccessExportSnapshots();
+    if (typeof exportId !== "string" || !/^[a-f0-9]{32}$/i.test(exportId)) {
+        return null;
+    }
+    const snapshot = successExportSnapshots.get(exportId);
+    return snapshot ? {id: exportId, snapshot} : null;
+}
+
 function heroSmsRpsStatus(config: AppConfig): JsonValue {
     const keys = getHeroSmsRpsStats(config.heroSMS.apiKeys, {rpsLimit: config.heroSMS.rpsLimit});
     const pendingTotal = keys.reduce((sum, item) => sum + (item.pendingTotal || 0), 0);
@@ -1165,18 +1218,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         const successEmails = successLines.map(emailFromLine).filter(Boolean);
         const costLines = await successCostLinesForEmails(config.cost, successEmails);
         const {buffer, matched, missing} = await buildSuccessExportZip(successLines, config.cpaJson.dir, costLines);
-        await pool.clearSuccessEmails(successEmails);
-        let removedCostRecords = 0;
-        try {
-            removedCostRecords = (await removeSuccessCostRecords(config.cost, successEmails)).removed;
-        } catch (costError) {
-            logger.warn(`[admin] 成功邮箱已导出，但成本流水清理失败: ${(costError as Error).message}`);
-        }
-        const filename = `free-register-success.${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
-        logger.info(`[admin] 导出并清空成功邮箱 emails=${successLines.length} cpa_json=${matched} missing=${missing.length} cost_records=${removedCostRecords} bytes=${buffer.length}`);
+        const exportId = createSuccessExportSnapshot(successEmails);
+        const filename = formatSuccessExportFileName(successEmails.length);
+        logger.info(`[admin] 导出成功邮箱快照 emails=${successLines.length} cpa_json=${matched} missing=${missing.length} export_id=${exportId} bytes=${buffer.length}`);
         send(res, 200, buffer, {
             "content-type": "application/zip",
             "content-disposition": `attachment; filename="${filename}"`,
+            "x-export-id": exportId,
+            "x-export-count": String(successEmails.length),
+            "x-export-filename": filename,
+        });
+        return;
+    }
+
+    if (pathname === "/api/email/success/export/clear" && req.method === "POST") {
+        const body = await readJson<{exportId?: unknown}>(req);
+        const exportSnapshot = getSuccessExportSnapshot(body.exportId);
+        if (!exportSnapshot) {
+            sendError(res, 404, "导出快照已过期或不存在，请重新导出后再删除");
+            return;
+        }
+
+        const config = loadConfig();
+        const pool = new EmailPool(config.emailPool);
+        await pool.clearSuccessEmails(exportSnapshot.snapshot.emails);
+        let removedCostRecords = 0;
+        try {
+            removedCostRecords = (await removeSuccessCostRecords(config.cost, exportSnapshot.snapshot.emails)).removed;
+        } catch (costError) {
+            logger.warn(`[admin] 成功邮箱已删除，但成本流水清理失败: ${(costError as Error).message}`);
+        }
+        successExportSnapshots.delete(exportSnapshot.id);
+        logger.info(`[admin] 清空已导出成功邮箱 emails=${exportSnapshot.snapshot.emails.length} cost_records=${removedCostRecords} export_id=${exportSnapshot.id}`);
+        sendJson(res, 200, {
+            ok: true,
+            deleted: exportSnapshot.snapshot.emails.length,
+            removedCostRecords,
         });
         return;
     }
@@ -1726,6 +1803,24 @@ function html(): string {
         pad(shifted.getUTCSeconds()) + " UTC+8";
     }
 
+    function formatUtc8TimeOnly(value) {
+      const text = formatUtc8Timestamp(value);
+      const matched = text.match(/\\b(\\d{2}:\\d{2}:\\d{2})\\b/);
+      return matched ? matched[1] : "";
+    }
+
+    function exportFileNameFromResponse(res) {
+      const explicit = res.headers.get("x-export-filename");
+      if (explicit) return explicit;
+      const disposition = res.headers.get("content-disposition") || "";
+      const matched = disposition.match(/filename="?([^";]+)"?/i);
+      return matched ? matched[1] : "free-register-success.zip";
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+
     function updateHeroSmsBalance(balance) {
       const meta = $("heroSmsBalanceMeta");
       meta.title = "";
@@ -1743,7 +1838,7 @@ function html(): string {
           return String((item && item.label) || "Key") + ": 查询失败";
         });
         setText("heroSmsBalance", balance.ok && balance.amount != null ? "合计 " + formatBalanceAmount(balance.amount) : "查询失败");
-        const time = formatUtc8Timestamp(balance.fetchedAt);
+        const time = formatUtc8TimeOnly(balance.fetchedAt);
         const text = parts.join(" | ") + (time ? " · " + (balance.cached ? "缓存 " : "刚更新 ") + time : "");
         setText("heroSmsBalanceMeta", text);
         meta.title = text;
@@ -1751,7 +1846,7 @@ function html(): string {
       }
       if (balance.ok && balance.amount != null) {
         setText("heroSmsBalance", formatBalanceAmount(balance.amount));
-        const time = formatUtc8Timestamp(balance.fetchedAt);
+        const time = formatUtc8TimeOnly(balance.fetchedAt);
         setText("heroSmsBalanceMeta", (balance.cached ? "缓存" : "刚更新") + (time ? " " + time : ""));
         return;
       }
@@ -2344,16 +2439,33 @@ function html(): string {
       try {
         const res = await api("/api/email/success/export", {method: "POST", body: "{}"});
         if (!res.ok) throw new Error("导出失败");
+        const exportId = res.headers.get("x-export-id") || "";
+        const exportCount = Number(res.headers.get("x-export-count") || "0");
+        const fileName = exportFileNameFromResponse(res);
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "free-register-success.zip";
+        a.download = fileName;
         document.body.appendChild(a);
         a.click();
         a.remove();
-        URL.revokeObjectURL(url);
-        setText("taskMsg", "成功邮箱已导出并清空");
+        window.setTimeout(() => URL.revokeObjectURL(url), 60 * 1000);
+        setText("taskMsg", "导出包已下载：" + fileName);
+        if (exportCount > 0 && exportId) {
+          await sleep(800);
+          const shouldClear = window.confirm("确认已经保存 " + fileName + " 后，删除这 " + exportCount + " 个成功邮箱？");
+          if (shouldClear) {
+            const data = await apiJson("/api/email/success/export/clear", {method: "POST", body: JSON.stringify({exportId})});
+            setText("taskMsg", "已删除 " + (data.deleted || exportCount) + " 个已导出成功邮箱");
+          } else {
+            setText("taskMsg", "已导出，成功邮箱已保留");
+          }
+        } else if (exportCount > 0) {
+          setText("taskMsg", "已导出，但没有删除令牌，成功邮箱已保留");
+        } else {
+          setText("taskMsg", "导出完成，没有成功邮箱需要删除");
+        }
         await refreshStatus();
       } catch (error) {
         setText("taskMsg", error.message);
