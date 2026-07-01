@@ -129,6 +129,44 @@ test("status API does not block on HeroSMS balance refresh", async () => {
     assert.match(source, /balance\.refreshing \? "刷新中"/);
 });
 
+test("admin page enters app through lightweight session before loading data", async () => {
+    const source = await adminSource();
+    const apiStart = source.indexOf("async function handleApi");
+    const apiEnd = source.indexOf("function html()", apiStart);
+    const apiSource = source.slice(apiStart, apiEnd);
+    const loginStart = source.indexOf("$(\"loginBtn\")");
+    const loginEnd = source.indexOf("$(\"password\").addEventListener", loginStart);
+    const loginSource = source.slice(loginStart, loginEnd);
+    const bootstrapStart = source.indexOf("async function bootstrapSession()");
+    const bootstrapEnd = source.indexOf("void bootstrapSession()", bootstrapStart);
+    const bootstrapSource = source.slice(bootstrapStart, bootstrapEnd);
+
+    assert.match(apiSource, /pathname === "\/api\/session" && req\.method === "GET"/);
+    assert.match(apiSource, /sendJson\(res,\s*200,\s*\{ok:\s*true\}\)/);
+    assert.match(bootstrapSource, /await apiJson\("\/api\/session"\)/);
+    assert.match(bootstrapSource, /enterAuthenticatedApp\(\)/);
+    assert.doesNotMatch(bootstrapSource, /\/api\/status/);
+    assert.match(source, /function enterAuthenticatedApp\(\)\s*\{[\s\S]*showApp\(\);[\s\S]*void loadInitialData\(\);[\s\S]*\}/);
+    assert.match(loginSource, /enterAuthenticatedApp\(\)/);
+    assert.doesNotMatch(loginSource, /await Promise\.all\(\[refreshStatus\(\), loadConfig\(\), loadSmsConfig\(\)\]\)/);
+});
+
+test("admin page shows skeletons while first data load is pending", async () => {
+    const source = await adminSource();
+
+    assert.match(source, /@keyframes skeleton-shimmer/);
+    assert.match(source, /function renderWorkerSkeleton\(\)/);
+    assert.match(source, /function setStatusLoading\(loading\)/);
+    assert.match(source, /function setConfigLoading\(loading\)/);
+    assert.match(source, /function setSmsConfigLoading\(loading\)/);
+    assert.match(source, /function loadInitialData\(\)/);
+    assert.match(source, /setStatusLoading\(true\);\s*setConfigLoading\(true\);\s*setSmsConfigLoading\(true\);/);
+    assert.match(source, /Promise\.allSettled\(\[refreshStatus\(\), loadConfig\(\), loadSmsConfig\(\)\]\)/);
+    assert.match(source, /state\.statusLoaded = true;\s*setStatusLoading\(false\);/);
+    assert.match(source, /state\.configLoaded = true;/);
+    assert.match(source, /state\.smsConfigLoaded = true;/);
+});
+
 test("admin sessions persist without storing raw cookie tokens", async () => {
     const source = await adminSource();
 

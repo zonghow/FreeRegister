@@ -1107,6 +1107,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: st
         return;
     }
 
+    if (pathname === "/api/session" && req.method === "GET") {
+        sendJson(res, 200, {ok: true});
+        return;
+    }
+
     if (pathname === "/api/logout" && req.method === "POST") {
         const token = parseCookies(req)[SESSION_COOKIE];
         if (token) {
@@ -1363,6 +1368,15 @@ function html(): string {
     .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .metric strong { display: block; margin-top: 2px; color: var(--text); font-size: 20px; line-height: 1.05; font-weight: 680; }
     .metric .sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    @keyframes skeleton-shimmer { 0% { background-position: 120% 0; } 100% { background-position: -120% 0; } }
+    .skeleton { display: inline-block; width: var(--skeleton-width, 72px); max-width: 100%; min-height: 1em; border-radius: 4px; color: transparent !important; background: linear-gradient(90deg, #ececea 0%, #f7f7f3 44%, #ececea 88%); background-size: 240% 100%; animation: skeleton-shimmer 1.15s ease-in-out infinite; }
+    strong.skeleton { min-height: 22px; vertical-align: bottom; }
+    .sub.skeleton { display: block; min-height: 13px; }
+    .status.skeleton { min-width: var(--skeleton-width, 96px); }
+    .worker-table .skeleton-cell { display: block; height: 14px; }
+    input.skeleton-control, select.skeleton-control, textarea.skeleton-control { color: transparent; background: linear-gradient(90deg, #ececea 0%, #f7f7f3 44%, #ececea 88%); background-size: 240% 100%; animation: skeleton-shimmer 1.15s ease-in-out infinite; }
+    .CodeMirror.skeleton-control { background: linear-gradient(90deg, #ececea 0%, #f7f7f3 44%, #ececea 88%); background-size: 240% 100%; animation: skeleton-shimmer 1.15s ease-in-out infinite; }
+    .CodeMirror.skeleton-control * { visibility: hidden; }
     #successCostMeta { white-space: pre-line; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
     #heroSmsBalanceMeta { white-space: normal; overflow-wrap: anywhere; }
     .sms-rps-list { display: grid; gap: 2px; max-height: 74px; overflow: auto; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.25; }
@@ -1631,6 +1645,13 @@ function html(): string {
       inflightCount: 0,
       runnerBusy: false,
       smsConfigDirty: false,
+      statusLoaded: false,
+      statusLoading: false,
+      configLoaded: false,
+      configLoading: false,
+      smsConfigLoaded: false,
+      smsConfigLoading: false,
+      initialDataLoading: false,
       configEditor: null,
       smsCountries: [],
       selectedSmsCountries: []
@@ -1641,6 +1662,7 @@ function html(): string {
       const res = await fetch(path, Object.assign({}, options, {headers}));
       if (res.status === 401) {
         state.authed = false;
+        resetLoadState();
         showLogin();
       }
       return res;
@@ -1666,6 +1688,138 @@ function html(): string {
 
     function setText(id, value) {
       $(id).textContent = value == null ? "" : String(value);
+    }
+
+    const statusSkeletonFields = [
+      ["countSource", "54px"],
+      ["countSuccess", "54px"],
+      ["successCostMeta", "96px"],
+      ["successRunMeta", "96px"],
+      ["countInflight", "54px"],
+      ["countFailed", "54px"],
+      ["memoryUsed", "92px"],
+      ["memoryMeta", "120px"],
+      ["heroSmsBalance", "92px"],
+      ["heroSmsBalanceMeta", "132px"],
+      ["heroSmsRpsTotal", "78px"],
+      ["runnerStatus", "96px"],
+      ["taskConfig", "260px"],
+      ["workerSummary", "96px"]
+    ];
+    const smsConfigControlIds = [
+      "runConcurrencyMode",
+      "successAfterEmailOtp",
+      "proxyMode",
+      "phoneCountryTemplate",
+      "smsProxyStrategy",
+      "smsApiKeyStrategy",
+      "smsAcquirePriority",
+      "smsMinPrice",
+      "smsMaxPrice",
+      "smsPriceStep",
+      "smsMaxPhoneTries",
+      "smsCountrySearch",
+      "smsCountryPicker"
+    ];
+
+    function setElementSkeleton(id, loading, width) {
+      const element = $(id);
+      if (!element) return;
+      element.classList.toggle("skeleton", Boolean(loading));
+      if (loading && width) {
+        element.style.setProperty("--skeleton-width", width);
+      } else {
+        element.style.removeProperty("--skeleton-width");
+      }
+    }
+
+    function appendSkeletonCell(row, className, width) {
+      const cell = document.createElement("td");
+      if (className) cell.className = className;
+      const bar = document.createElement("span");
+      bar.className = "skeleton skeleton-cell";
+      bar.style.setProperty("--skeleton-width", width);
+      cell.appendChild(bar);
+      row.appendChild(cell);
+    }
+
+    function renderWorkerSkeleton() {
+      const rows = $("workerRows");
+      rows.textContent = "";
+      const widths = ["34px", "58px", "72px", "42px", "150px", "92px", "50px", "220px"];
+      const classes = ["worker-col-id", "worker-col-status", "worker-col-stage", "worker-col-job", "", "worker-col-phone", "worker-col-time", "worker-col-log"];
+      for (let i = 0; i < 5; i += 1) {
+        const row = document.createElement("tr");
+        widths.forEach((width, index) => appendSkeletonCell(row, classes[index], width));
+        rows.appendChild(row);
+      }
+    }
+
+    function renderCountrySkeleton() {
+      const box = $("smsCountryList");
+      box.textContent = "";
+      ["86px", "104px", "76px"].forEach((width) => {
+        const pill = document.createElement("span");
+        pill.className = "skeleton";
+        pill.style.setProperty("--skeleton-width", width);
+        pill.style.minHeight = "28px";
+        box.appendChild(pill);
+      });
+    }
+
+    function setStatusLoading(loading) {
+      state.statusLoading = Boolean(loading);
+      const active = state.statusLoading && !state.statusLoaded;
+      statusSkeletonFields.forEach(([id, width]) => setElementSkeleton(id, active, width));
+      if (active) {
+        setText("taskConfig", "");
+        setText("workerSummary", "");
+        renderWorkerSkeleton();
+      }
+    }
+
+    function setConfigLoading(loading) {
+      state.configLoading = Boolean(loading);
+      const active = state.configLoading && !state.configLoaded;
+      $("configText").disabled = active;
+      $("configText").classList.toggle("skeleton-control", active);
+      $("saveConfigBtn").disabled = active;
+      $("reloadConfigBtn").disabled = active;
+      if (state.configEditor) {
+        const wrapper = state.configEditor.getWrapperElement();
+        wrapper.classList.toggle("skeleton-control", active);
+        state.configEditor.setOption("readOnly", active ? "nocursor" : false);
+      }
+    }
+
+    function setSmsConfigLoading(loading) {
+      state.smsConfigLoading = Boolean(loading);
+      const active = state.smsConfigLoading && !state.smsConfigLoaded;
+      smsConfigControlIds.forEach((id) => {
+        const element = $(id);
+        element.disabled = active;
+        element.classList.toggle("skeleton-control", active);
+      });
+      $("saveSmsConfigBtn").disabled = active;
+      $("reloadSmsConfigBtn").disabled = active;
+      $("smsAddCountryBtn").disabled = active;
+      setElementSkeleton("smsCountrySource", active, "140px");
+      if (active) {
+        renderCountrySkeleton();
+      } else {
+        $("smsCountryList").querySelectorAll(".skeleton").forEach((item) => item.remove());
+        renderCountryPicker();
+      }
+    }
+
+    function resetLoadState() {
+      state.statusLoaded = false;
+      state.configLoaded = false;
+      state.smsConfigLoaded = false;
+      state.initialDataLoading = false;
+      setStatusLoading(false);
+      setConfigLoading(false);
+      setSmsConfigLoading(false);
     }
 
     const workerStageLabels = {
@@ -2069,21 +2223,28 @@ function html(): string {
     }
 
     async function loadSmsConfig(refreshCountries = false) {
-      const data = await apiJson("/api/sms-config" + (refreshCountries ? "?refreshCountries=1" : ""));
-      state.smsCountries = data.countries || [];
-      const source = data.countriesSource === "api" ? "HeroSMS 接口" : "内置兜底";
-      const cached = data.countriesCached ? " / 永久缓存" : "";
-      setText("smsCountrySource", "国家列表：" + source + cached);
-      if (data.countriesError) {
-        const prefix = data.countriesSource === "fallback" ? "国家列表接口失败，已用内置列表：" : "国家列表刷新失败，继续使用永久缓存：";
-        setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
+      const firstLoad = !state.smsConfigLoaded;
+      if (firstLoad) setSmsConfigLoading(true);
+      try {
+        const data = await apiJson("/api/sms-config" + (refreshCountries ? "?refreshCountries=1" : ""));
+        state.smsCountries = data.countries || [];
+        const source = data.countriesSource === "api" ? "HeroSMS 接口" : "内置兜底";
+        const cached = data.countriesCached ? " / 永久缓存" : "";
+        setText("smsCountrySource", "国家列表：" + source + cached);
+        if (data.countriesError) {
+          const prefix = data.countriesSource === "fallback" ? "国家列表接口失败，已用内置列表：" : "国家列表刷新失败，继续使用永久缓存：";
+          setText("smsConfigMsg", prefix + String(data.countriesError).slice(0, 80));
+        }
+        if (data.run) $("runConcurrencyMode").value = data.run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
+        if (data.run) $("successAfterEmailOtp").checked = data.run.successAfterEmailOtp === true;
+        fillProxyForm(data.proxy || {});
+        fillSmsForm(data.heroSMS || {});
+        state.smsConfigDirty = false;
+        state.smsConfigLoaded = true;
+        renderCountryPicker();
+      } finally {
+        if (firstLoad) setSmsConfigLoading(false);
       }
-      if (data.run) $("runConcurrencyMode").value = data.run.concurrencyMode === "adaptive" ? "adaptive" : "fixed";
-      if (data.run) $("successAfterEmailOtp").checked = data.run.successAfterEmailOtp === true;
-      fillProxyForm(data.proxy || {});
-      fillSmsForm(data.heroSMS || {});
-      state.smsConfigDirty = false;
-      renderCountryPicker();
     }
 
     function smsPayloadFromForm() {
@@ -2115,6 +2276,8 @@ function html(): string {
 
     function applyStatusData(data) {
       state.authed = true;
+      state.statusLoaded = true;
+      setStatusLoading(false);
       showApp();
       const pool = data.pool || {};
       const runner = data.runner || {};
@@ -2165,9 +2328,13 @@ function html(): string {
     }
 
     async function refreshStatus() {
+      if (!state.authed) return;
+      const firstLoad = !state.statusLoaded;
+      if (firstLoad) setStatusLoading(true);
       try {
         applyStatusData(await apiJson("/api/status"));
       } catch (error) {
+        if (firstLoad) setStatusLoading(false);
         if (state.authed) setText("taskMsg", error.message);
       }
     }
@@ -2344,9 +2511,44 @@ function html(): string {
     }
 
     async function loadConfig() {
-      const data = await apiJson("/api/config");
-      setConfigContent(data.content || "");
-      setText("configPath", data.path || "");
+      const firstLoad = !state.configLoaded;
+      if (firstLoad) setConfigLoading(true);
+      try {
+        const data = await apiJson("/api/config");
+        setConfigContent(data.content || "");
+        setText("configPath", data.path || "");
+        state.configLoaded = true;
+      } finally {
+        if (firstLoad) setConfigLoading(false);
+      }
+    }
+
+    function settledErrorMessage(result) {
+      if (!result || result.status !== "rejected") return "";
+      const reason = result.reason;
+      return reason && reason.message ? reason.message : String(reason || "加载失败");
+    }
+
+    async function loadInitialData() {
+      if (state.initialDataLoading) return;
+      state.initialDataLoading = true;
+      setStatusLoading(true);
+      setConfigLoading(true);
+      setSmsConfigLoading(true);
+      try {
+        const results = await Promise.allSettled([refreshStatus(), loadConfig(), loadSmsConfig()]);
+        const error = results.map(settledErrorMessage).find(Boolean);
+        if (error && state.authed) setText("taskMsg", error);
+      } finally {
+        state.initialDataLoading = false;
+      }
+    }
+
+    function enterAuthenticatedApp() {
+      state.authed = true;
+      showApp();
+      connectLogStream();
+      void loadInitialData();
     }
 
     $("loginBtn").onclick = async () => {
@@ -2354,9 +2556,8 @@ function html(): string {
         await apiJson("/api/login", {method: "POST", body: JSON.stringify({password: $("password").value})});
         $("password").value = "";
         setText("loginMsg", "");
-        state.authed = true;
-        showApp();
-        await Promise.all([refreshStatus(), loadConfig(), loadSmsConfig()]);
+        resetLoadState();
+        enterAuthenticatedApp();
       } catch (error) {
         setText("loginMsg", error.message);
       }
@@ -2370,6 +2571,7 @@ function html(): string {
       await api("/api/logout", {method: "POST", body: "{}"});
       state.authed = false;
       closeLogStream();
+      resetLoadState();
       showLogin();
     };
 
@@ -2534,13 +2736,19 @@ function html(): string {
       }
     };
 
-    refreshStatus().then(() => {
-      if (state.authed) {
-        connectLogStream();
-        Promise.all([loadConfig(), loadSmsConfig()]);
+    async function bootstrapSession() {
+      try {
+        await apiJson("/api/session");
+        resetLoadState();
+        enterAuthenticatedApp();
+      } catch {
+        state.authed = false;
+        showLogin();
       }
-    });
-    setInterval(refreshStatus, 2500);
+    }
+
+    void bootstrapSession();
+    setInterval(() => { if (state.authed) void refreshStatus(); }, 2500);
     setInterval(refreshHeroSmsRps, 1000);
   </script>
 </body>
