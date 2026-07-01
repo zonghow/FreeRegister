@@ -13,6 +13,7 @@ import {
     RegisterTaskRunner,
     runOne,
     shouldStopPhoneRetryForPause,
+    smsOtpCostForLease,
     type RunnerStatus,
     type WorkerSnapshot,
 } from "../src/runner.js";
@@ -284,6 +285,54 @@ test("normal pause stops phone retry without taking the force-pause path", () =>
     assert.equal(shouldStopPhoneRetryForPause(false), false);
     assert.equal(shouldStopPhoneRetryForPause(true), true);
     assert.equal(shouldStopPhoneRetryForPause(true, AbortSignal.abort()), false);
+});
+
+test("sms otp cost is taken from the lease that received phone OTP", () => {
+    assert.equal(smsOtpCostForLease({activationCost: 0.1234567}), 0.123457);
+    assert.equal(smsOtpCostForLease({activationCost: "0.25"}), 0.25);
+    assert.equal(smsOtpCostForLease({activationCost: undefined}), 0);
+    assert.equal(smsOtpCostForLease({activationCost: -1}), 0);
+});
+
+test("runOne records only the OTP phone cost for successful accounts", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "free-register-otp-cost-"));
+    const config = testConfig(dir);
+    const pool = new EmailPool(config.emailPool);
+
+    try {
+        await writeFile(config.emailPool.source, `${fakeEmailLine(1)}\n`);
+
+        const result = await runOne(
+            config,
+            pool,
+            1,
+            1,
+            {info() {}, warn() {}, error() {}},
+            undefined,
+            undefined,
+            undefined,
+            {
+                phoneSignup: async () => ({
+                    phone: "+15550000001",
+                    proxyUrl: "direct",
+                    smsCost: 0.27,
+                    smsGrossCost: 0.27,
+                    smsRefundCost: 0,
+                }),
+                bindEmailViaOAuth: async () => {},
+            },
+        );
+
+        assert.equal(result.ok, true);
+        const ledger = JSON.parse((await readFile(config.cost.successLedger, "utf8")).trim()) as Record<string, unknown>;
+        assert.equal(ledger.email, "user1@outlook.com");
+        assert.equal(ledger.smsCost, 0.27);
+        assert.equal(ledger.smsGrossCost, 0.27);
+        assert.equal(ledger.smsRefundCost, 0);
+        assert.equal(ledger.totalCost, 0.28);
+    } finally {
+        await rm(dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    }
 });
 
 test("runOne retries a new email after retryable bind failures on the same phone", async () => {

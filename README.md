@@ -300,13 +300,13 @@ Web 后台导出成功邮箱时，会生成一个 zip，包含：
 
 ## 成本统计
 
-后台“成功”卡片会展示当前成功邮箱池里的总花费和平均花费。成本写入 `cost.success.jsonl`，每个成功账号一行 JSON，默认按 `[cost].email_unit_cost = 0.05` 计算邮箱成本，并叠加该账号成功前实际取过的 HeroSMS 号码净成本。
+后台“成功”卡片会展示当前成功邮箱池里的总花费和平均花费。成本写入 `cost.success.jsonl`，每个成功账号一行 JSON，默认按 `[cost].email_unit_cost = 0.05` 计算邮箱成本，并叠加最终收到手机 OTP 的 HeroSMS 号码成本。
 
-短信成本会同时记录：
+短信成本只按收到 OTP 的号码计入：
 
-- `smsGrossCost`：成功前取过的号码毛成本。
-- `smsRefundCost`：`cancelAndWithdraw` 或超时自动释放成功后抵扣的退款成本。
-- `smsCost`：最终计入账号成本的净短信成本。
+- `smsCost`：最终收到手机 OTP 的号码成本。
+- `smsGrossCost`：兼容旧导出字段，当前等于 `smsCost`。
+- `smsRefundCost`：兼容旧导出字段，当前固定为 `0`，不再抵扣取消号码返还。
 
 如果已有成功邮箱是在成本流水功能上线前生成的，后台会按邮箱单价估算这些账号的成本，短信成本记为 `0`。
 

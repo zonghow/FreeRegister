@@ -512,6 +512,11 @@ function bindEmailFailureReason(error: unknown): string {
     return isEmailTouchedError(error) ? message : `oauth_uncertain: ${message}`;
 }
 
+export function smsOtpCostForLease(lease: {activationCost?: unknown}): number {
+    const cost = Number(lease.activationCost);
+    return Number.isFinite(cost) && cost > 0 ? Math.round(cost * 1_000_000) / 1_000_000 : 0;
+}
+
 async function phoneSignup(
     config: AppConfig,
     workerId: number,
@@ -524,6 +529,7 @@ async function phoneSignup(
     const poolProxyUrl = proxyForWorker(config, workerId - 1);
     const smsBroker = createBroker(config, smsProxyUrl);
     let lastErr: unknown = null;
+    let otpSmsCost = 0;
 
     for (let phoneTry = 1; phoneTry <= config.heroSMS.maxPhoneTries; phoneTry += 1) {
         throwIfForcePaused(signal);
@@ -602,6 +608,7 @@ async function phoneSignup(
                 });
                 logger.info(`[worker-${workerId}] [phone] 等待 OTP...`);
                 const {code} = await lease.waitForVerificationCode({signal});
+                otpSmsCost = smsOtpCostForLease(lease);
                 throwIfForcePaused(signal);
                 updateWorker?.({
                     status: "running",
@@ -620,13 +627,12 @@ async function phoneSignup(
                 latestLog: `手机注册成功 ${phoneNumber}`,
             });
             logger.info(`[worker-${workerId}] [phone] 注册成功 ${phoneNumber}`);
-            const cost = smsBroker.getCostSummary();
             return {
                 phone: phoneNumber,
                 proxyUrl,
-                smsCost: cost.netCost,
-                smsGrossCost: cost.grossCost,
-                smsRefundCost: cost.refundCost,
+                smsCost: otpSmsCost,
+                smsGrossCost: otpSmsCost,
+                smsRefundCost: 0,
             };
         } catch (error) {
             if (signal?.aborted) {
@@ -933,7 +939,7 @@ export async function runOne(
                     smsRefundCost,
                     currency: config.cost.currency,
                 });
-                logger.info(`[worker-${workerId}] [cost] email=${emailLease.email} sms_gross=${costRecord.smsGrossCost} sms_refund=${costRecord.smsRefundCost} sms=${costRecord.smsCost} email_cost=${costRecord.emailCost} total=${costRecord.totalCost} ${costRecord.currency}`);
+                logger.info(`[worker-${workerId}] [cost] email=${emailLease.email} sms_otp=${costRecord.smsCost} email_cost=${costRecord.emailCost} total=${costRecord.totalCost} ${costRecord.currency}`);
             } catch (costError) {
                 logger.warn(`[worker-${workerId}] [cost] 成本流水写入失败，不影响成功结果: ${(costError as Error).message}`);
             }
