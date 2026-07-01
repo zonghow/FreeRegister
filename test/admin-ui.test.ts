@@ -115,6 +115,20 @@ test("sms config save persists only visible run mode fields", async () => {
     }
 });
 
+test("status API does not block on HeroSMS balance refresh", async () => {
+    const source = await adminSource();
+    const statusStart = source.indexOf("async function currentStatus");
+    const statusEnd = source.indexOf("async function handleApi", statusStart);
+    const statusSource = source.slice(statusStart, statusEnd);
+
+    assert.match(source, /function startHeroSmsBalanceRefresh/);
+    assert.match(source, /function heroSmsBalanceSnapshot/);
+    assert.match(source, /HERO_SMS_BALANCE_IN_FLIGHT_STALE_MS/);
+    assert.match(statusSource, /heroSmsBalance:\s*heroSmsBalanceStatus\(config/);
+    assert.doesNotMatch(statusSource, /heroSmsBalance:\s*await heroSmsBalanceStatus/);
+    assert.match(source, /balance\.refreshing \? "刷新中"/);
+});
+
 test("admin sessions persist without storing raw cookie tokens", async () => {
     const source = await adminSource();
 

@@ -51,6 +51,7 @@ const SESSION_PERSIST_FILE = ".admin-sessions.json";
 const SESSION_PERSIST_THROTTLE_MS = 30 * 1000;
 const HERO_SMS_BALANCE_TTL_MS = 30 * 1000;
 const HERO_SMS_BALANCE_TIMEOUT_MS = 5000;
+const HERO_SMS_BALANCE_IN_FLIGHT_STALE_MS = 60 * 1000;
 const HERO_SMS_COUNTRIES_TIMEOUT_MS = 10000;
 const HERO_SMS_COUNTRIES_CACHE_VERSION = 1;
 const HERO_SMS_COUNTRIES_CACHE_FILE = path.join(".cache", "hero-sms-countries.json");
@@ -209,7 +210,7 @@ const sessions = new Map<string, number>();
 let sessionPersistTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionPersistPromise: Promise<void> = Promise.resolve();
 let heroSmsBalanceCache: {key: string; expiresAt: number; value: JsonValue} | null = null;
-let heroSmsBalanceInFlight: {key: string; promise: Promise<JsonValue>} | null = null;
+let heroSmsBalanceInFlight: {key: string; startedAt: number; promise: Promise<JsonValue>} | null = null;
 let heroSmsCountriesCache: HeroSmsCountriesStatus | null = null;
 let heroSmsCountriesInFlight: Promise<HeroSmsCountriesStatus> | null = null;
 const originalConsole = {
@@ -782,99 +783,134 @@ async function heroSmsCountriesStatus(config: AppConfig, refresh = false): Promi
     }
 }
 
-async function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: boolean} = {}): Promise<JsonValue> {
+async function fetchHeroSmsBalance(config: AppConfig): Promise<JsonValue> {
     const apiKeys = config.heroSMS.apiKeys;
-    if (!apiKeys.length) {
+    const balances = await Promise.all(apiKeys.map(async (apiKey, index): Promise<JsonValue> => {
+        const label = redactHeroSmsApiKey(apiKey, index);
+        try {
+            const provider = createHeroSmsProvider({
+                apiKey,
+                proxyUrl: heroSmsProxyForWorker(config, index),
+                timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
+                rpsLimit: config.heroSMS.rpsLimit,
+                rateLimitLabel: label,
+            });
+            const balance = await provider.getBalance();
+            if (balance.amount <= 0) {
+                disableHeroSmsApiKey(apiKey, "no_balance", label);
+            } else {
+                enableHeroSmsApiKeyIfReason(apiKey, "no_balance", label);
+            }
+            return {
+                ok: true,
+                index: index + 1,
+                label,
+                amount: balance.amount,
+                disabled: balance.amount <= 0,
+                disabledReason: balance.amount <= 0 ? "no_balance" : "",
+                raw: typeof balance.raw === "string" ? balance.raw : JSON.stringify(balance.raw),
+                fetchedAt: new Date().toISOString(),
+            };
+        } catch (error) {
+            return {
+                ok: false,
+                index: index + 1,
+                label,
+                error: error instanceof Error ? error.message : String(error),
+                fetchedAt: new Date().toISOString(),
+            };
+        }
+    }));
+
+    const successful = balances.filter((item): item is Record<string, JsonValue> =>
+        Boolean((item as Record<string, JsonValue>).ok) &&
+        typeof (item as Record<string, JsonValue>).amount === "number",
+    );
+    const total = successful.reduce((sum, item) => sum + Number(item.amount), 0);
+
+    if (successful.length > 0) {
+        return {
+            ok: true,
+            amount: total,
+            balances,
+            successCount: successful.length,
+            failureCount: balances.length - successful.length,
+            fetchedAt: new Date().toISOString(),
+        };
+    }
+
+    return {
+        ok: false,
+        balances,
+        error: "所有 HeroSMS key 余额查询失败",
+        fetchedAt: new Date().toISOString(),
+    };
+}
+
+function heroSmsBalanceSnapshot(key: string): JsonValue {
+    const now = Date.now();
+    const refreshing = heroSmsBalanceInFlight?.key === key;
+    if (heroSmsBalanceCache?.key === key) {
+        return {
+            ...heroSmsBalanceCache.value as Record<string, JsonValue>,
+            cached: true,
+            stale: heroSmsBalanceCache.expiresAt <= now,
+            refreshing,
+        };
+    }
+    return {
+        ok: false,
+        refreshing,
+        error: refreshing ? "HeroSMS 余额刷新中" : "HeroSMS 余额尚未刷新",
+    };
+}
+
+function startHeroSmsBalanceRefresh(config: AppConfig, options: {forceRefresh?: boolean} = {}): void {
+    const apiKeys = config.heroSMS.apiKeys;
+    if (!apiKeys.length) return;
+
+    const key = heroSmsBalanceCacheKey(config);
+    const now = Date.now();
+    const cacheFresh = heroSmsBalanceCache?.key === key && heroSmsBalanceCache.expiresAt > now;
+    if (!options.forceRefresh && cacheFresh) return;
+
+    const inFlightFresh =
+        heroSmsBalanceInFlight?.key === key &&
+        now - heroSmsBalanceInFlight.startedAt < HERO_SMS_BALANCE_IN_FLIGHT_STALE_MS;
+    if (inFlightFresh) return;
+
+    let promise: Promise<JsonValue>;
+    promise = fetchHeroSmsBalance(config)
+        .catch((error): JsonValue => ({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            fetchedAt: new Date().toISOString(),
+        }))
+        .then((value) => {
+            heroSmsBalanceCache = {
+                key,
+                expiresAt: Date.now() + HERO_SMS_BALANCE_TTL_MS,
+                value,
+            };
+            return value;
+        })
+        .finally(() => {
+            if (heroSmsBalanceInFlight?.promise === promise) {
+                heroSmsBalanceInFlight = null;
+            }
+        });
+
+    heroSmsBalanceInFlight = {key, startedAt: now, promise};
+}
+
+function heroSmsBalanceStatus(config: AppConfig, options: {forceRefresh?: boolean} = {}): JsonValue {
+    if (!config.heroSMS.apiKeys.length) {
         return {ok: false, error: "HeroSMS api_keys/api_key 未配置"};
     }
 
     const key = heroSmsBalanceCacheKey(config);
-    const now = Date.now();
-    if (!options.forceRefresh && heroSmsBalanceCache?.key === key && heroSmsBalanceCache.expiresAt > now) {
-        return {...heroSmsBalanceCache.value as Record<string, JsonValue>, cached: true};
-    }
-
-    if (heroSmsBalanceInFlight?.key === key) {
-        return heroSmsBalanceInFlight.promise;
-    }
-
-    const promise: Promise<JsonValue> = (async (): Promise<JsonValue> => {
-        const balances = await Promise.all(apiKeys.map(async (apiKey, index): Promise<JsonValue> => {
-            const label = redactHeroSmsApiKey(apiKey, index);
-            try {
-                const provider = createHeroSmsProvider({
-                    apiKey,
-                    proxyUrl: heroSmsProxyForWorker(config, index),
-                    timeoutMs: HERO_SMS_BALANCE_TIMEOUT_MS,
-                    rpsLimit: config.heroSMS.rpsLimit,
-                    rateLimitLabel: label,
-                });
-                const balance = await provider.getBalance();
-                if (balance.amount <= 0) {
-                    disableHeroSmsApiKey(apiKey, "no_balance", label);
-                } else {
-                    enableHeroSmsApiKeyIfReason(apiKey, "no_balance", label);
-                }
-                return {
-                    ok: true,
-                    index: index + 1,
-                    label,
-                    amount: balance.amount,
-                    disabled: balance.amount <= 0,
-                    disabledReason: balance.amount <= 0 ? "no_balance" : "",
-                    raw: typeof balance.raw === "string" ? balance.raw : JSON.stringify(balance.raw),
-                    fetchedAt: new Date().toISOString(),
-                };
-            } catch (error) {
-                return {
-                    ok: false,
-                    index: index + 1,
-                    label,
-                    error: error instanceof Error ? error.message : String(error),
-                    fetchedAt: new Date().toISOString(),
-                };
-            }
-        }));
-
-        const successful = balances.filter((item): item is Record<string, JsonValue> =>
-            Boolean((item as Record<string, JsonValue>).ok) &&
-            typeof (item as Record<string, JsonValue>).amount === "number",
-        );
-        const total = successful.reduce((sum, item) => sum + Number(item.amount), 0);
-
-        if (successful.length > 0) {
-            return {
-                ok: true,
-                amount: total,
-                balances,
-                successCount: successful.length,
-                failureCount: balances.length - successful.length,
-                fetchedAt: new Date().toISOString(),
-            };
-        }
-
-        return {
-            ok: false,
-            balances,
-            error: "所有 HeroSMS key 余额查询失败",
-            fetchedAt: new Date().toISOString(),
-        };
-    })();
-
-    heroSmsBalanceInFlight = {key, promise};
-    try {
-        const value = await promise;
-        heroSmsBalanceCache = {
-            key,
-            expiresAt: Date.now() + HERO_SMS_BALANCE_TTL_MS,
-            value,
-        };
-        return value;
-    } finally {
-        if (heroSmsBalanceInFlight?.promise === promise) {
-            heroSmsBalanceInFlight = null;
-        }
-    }
+    startHeroSmsBalanceRefresh(config, options);
+    return heroSmsBalanceSnapshot(key);
 }
 
 interface CpaJsonFile {
@@ -1035,7 +1071,7 @@ async function currentStatus(options: {refreshBalance?: boolean} = {}): Promise<
             runner: runner.getSnapshot() as unknown as JsonValue,
             pool: poolStats as unknown as JsonValue,
             successCost: await summarizeSuccessCosts(config.cost, successLines) as unknown as JsonValue,
-            heroSmsBalance: await heroSmsBalanceStatus(config, {forceRefresh: options.refreshBalance}),
+            heroSmsBalance: heroSmsBalanceStatus(config, {forceRefresh: options.refreshBalance}),
             heroSmsRps: heroSmsRpsStatus(config),
             configPath: configPath(),
             effectiveConfig: publicConfigSummary(config),
@@ -1838,7 +1874,8 @@ function html(): string {
         });
         setText("heroSmsBalance", balance.ok && balance.amount != null ? "合计 " + formatBalanceAmount(balance.amount) : "查询失败");
         const time = formatUtc8TimeOnly(balance.fetchedAt);
-        const text = parts.join(" | ") + (time ? " · " + (balance.cached ? "缓存 " : "刚更新 ") + time : "");
+        const stateText = balance.refreshing ? "刷新中" : (balance.cached ? (balance.stale ? "旧缓存" : "缓存") : "刚更新");
+        const text = parts.join(" | ") + (time ? " · " + stateText + " " + time : (balance.refreshing ? " · 刷新中" : ""));
         setText("heroSmsBalanceMeta", text);
         meta.title = text;
         return;
@@ -1846,7 +1883,13 @@ function html(): string {
       if (balance.ok && balance.amount != null) {
         setText("heroSmsBalance", formatBalanceAmount(balance.amount));
         const time = formatUtc8TimeOnly(balance.fetchedAt);
-        setText("heroSmsBalanceMeta", (balance.cached ? "缓存" : "刚更新") + (time ? " " + time : ""));
+        const stateText = balance.refreshing ? "刷新中" : (balance.cached ? (balance.stale ? "旧缓存" : "缓存") : "刚更新");
+        setText("heroSmsBalanceMeta", stateText + (time ? " " + time : ""));
+        return;
+      }
+      if (balance.refreshing) {
+        setText("heroSmsBalance", "刷新中");
+        setText("heroSmsBalanceMeta", String(balance.error || "后台刷新中").slice(0, 64));
         return;
       }
       setText("heroSmsBalance", "查询失败");
