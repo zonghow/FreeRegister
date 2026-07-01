@@ -973,14 +973,13 @@ function formatSuccessExportFileName(count: number, value: Date | number | strin
     const timestamp = date.getTime();
     const safeCount = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
     if (!Number.isFinite(timestamp)) {
-        return `${safeCount}-0000-000000.zip`;
+        return `FREE-${safeCount}-0000000000.zip`;
     }
 
     const shifted = new Date(timestamp + 8 * 60 * 60 * 1000);
     const pad = (item: number) => String(item).padStart(2, "0");
-    const monthDay = `${pad(shifted.getUTCMonth() + 1)}${pad(shifted.getUTCDate())}`;
-    const clock = `${pad(shifted.getUTCHours())}${pad(shifted.getUTCMinutes())}${pad(shifted.getUTCSeconds())}`;
-    return `${safeCount}-${monthDay}-${clock}.zip`;
+    const timestampLabel = `${pad(shifted.getUTCMonth() + 1)}${pad(shifted.getUTCDate())}${pad(shifted.getUTCHours())}${pad(shifted.getUTCMinutes())}${pad(shifted.getUTCSeconds())}`;
+    return `FREE-${safeCount}-${timestampLabel}.zip`;
 }
 
 function cleanupSuccessExportSnapshots(now = Date.now()): void {
